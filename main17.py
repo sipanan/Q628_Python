@@ -1,0 +1,2274 @@
+import socket
+import struct
+import threading
+import time
+import traceback
+import sys
+import datetime
+import logging
+import smbus2
+import RPi.GPIO as GPIO
+import subprocess
+import os
+from enum import Enum, Flag, auto
+from typing import Dict, Any, Optional, Tuple, Union, List
+from collections import deque
+
+
+# ===== Configuration Constants =====
+class Config:
+    """System configuration constants"""
+    # I2C Addresses and Commands
+    I2C_ADDR_MOTOR = 0x1b
+    CMD_UP = 0x0E
+    CMD_DOWN = 0x0C
+    CMD_PASSIV = 0x0D  # Motor passive mode command
+    CMD_STATUS = 0x40  # Motor status request command
+    HYT_ADDR = 0x28
+
+    # Motor Status Masks
+    MASK_BUSY = 0b10000000  # Motor is busy
+    MASK_HOME = 0b01000000  # Motor is in home position
+    MASK_ERR  = 0b00100000  # Motor error
+    MASK_ACT  = 0b00010000  # Motor is active
+
+    # Reference Voltages
+    VREF_ADC = 2.048
+    VREF_DAC = 4.096
+    DAC_GAIN = 1.2
+
+    # GPIO Pin Assignments
+    PIN_CS_ADC = 10
+    PIN_CLK_ADC = 11
+    PIN_SDO_ADC = 9
+    PIN_DAT_DAC = 23
+    PIN_CLK_DAC = 24
+    PIN_CS_DAC = 25
+    MAGNET1_GPIO = 13
+    MAGNET2_GPIO = 27
+    START_LED_GPIO = 26
+    START_TASTE_GPIO = 22
+    HVAC_GPIO = 12
+
+    # Network Configuration
+    PRIMARY_PORT = 9760
+    COMPAT_PORT = 5760
+    BUFFER_SIZE = 1024
+
+    # Timing Constants
+    BUTTON_POLL_INTERVAL = 0.1
+    BUTTON_DEBOUNCE_TIME = 0.05
+    LED_BLINK_SLOW = 0.5
+    LED_BLINK_FAST = 0.1
+    MEASUREMENT_TOTAL_TIME = 60  # Total measurement time in seconds
+    PREPARATION_TIME = 7         # Initial preparation time in seconds
+    MOTOR_MOVEMENT_TIME = 3      # Time to wait for motor movement
+    STATUS_UPDATE_INTERVAL = 30  # Status monitor update interval
+    MOTOR_STATUS_POLL_INTERVAL = 1.0  # How often to poll motor status
+    ADC_SAMPLE_INTERVAL = 0.1    # How often to sample ADC during measurement
+    HYT_SAMPLE_INTERVAL = 1.0    # How often to measure temperature and humidity
+    TEMP_HUMID_SAMPLE_INTERVAL = 1.0  # Interval for temperature and humidity measurement
+
+    # File Paths
+    LOG_FILE = "qumat628.log"
+
+    # Device Information
+    SERIAL_NUMBER = 6280004
+    FIRMWARE_VERSION_MAJOR = 6
+    FIRMWARE_VERSION_MINOR = 2
+
+    # ADC/DAC Configuration
+    ADC_BUFFER_SIZE = 2000       # Size of ring buffer for ADC samples
+    ADC_CLK_DELAY = 0.00001      # Clock delay for bit-banged SPI
+    DAC_CLK_DELAY = 0.00001      # Clock delay for bit-banged SPI
+
+    # Profile Delays (in seconds)
+    PROFILE_DELAYS = {
+        0: 0.2, 1: 0.3, 2: 0.6, 3: 1.0, 4: 2.0, 5: 4.0,
+        6: 8.0, 7: 8.0, 8: 12.0, 9: 12.0, 10: 20.0,
+        11: 20.0, 12: 40.0, 13: 40.0
+    }
+    DEFAULT_PROFILE_DELAY = 5.0  # Default profile delay if not found in PROFILE_DELAYS
+
+
+# ===== Enumerations for State Management =====
+class MotorPosition(Enum):
+    """Motor position states"""
+    UP = "hoch"
+    DOWN = "runter"
+    UNKNOWN = "unbekannt"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class ValveStatus(Enum):
+    """Valve status states"""
+    OPEN = "auf"
+    CLOSED = "zu"
+    UNKNOWN = "unbekannt"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class CommandType(Enum):
+    """TCP command types"""
+    START = 'S'        # Enable measurement (requires button press)
+    TRIGGER = 'T'      # Simulate button press
+    GET_STATUS = 'G'   # Poll status
+    MOTOR_UP = 'U'     # Move motor up
+    MOTOR_DOWN = 'D'   # Move motor down
+    RESET = 'R'        # Reset system state
+    UNKNOWN = '?'      # Unknown command
+
+
+class MotorStatus(Flag):
+    """Motor status flags"""
+    NONE = 0
+    ACTIVE = auto()    # Motor is active
+    ERROR = auto()     # Motor has error
+    HOME = auto()      # Motor is in home position
+    BUSY = auto()      # Motor is busy
+
+    @classmethod
+    def from_byte(cls, status_byte: int) -> 'MotorStatus':
+        """Create MotorStatus from status byte"""
+        result = cls.NONE
+        if status_byte & Config.MASK_ACT:
+            result |= cls.ACTIVE
+        if status_byte & Config.MASK_ERR:
+            result |= cls.ERROR
+        if status_byte & Config.MASK_HOME:
+            result |= cls.HOME
+        if status_byte & Config.MASK_BUSY:
+            result |= cls.BUSY
+        return result
+
+    def to_dict(self) -> Dict[str, bool]:
+        """Convert to dictionary for easier access"""
+        return {
+            "active": bool(self & self.ACTIVE),
+            "error": bool(self & self.ERROR),
+            "home": bool(self & self.HOME),
+            "busy": bool(self & self.BUSY)
+        }
+
+    def __str__(self) -> str:
+        """Human-readable status representation"""
+        parts = []
+        if self & self.BUSY:
+            parts.append("🟡 Busy")
+        else:
+            parts.append("✅ Ready")
+        if self & self.HOME:
+            parts.append("🏠 Home")
+        if self & self.ERROR:
+            parts.append("❌ Error")
+        if self & self.ACTIVE:
+            parts.append("⚙️ Active")
+        return " | ".join(parts) if parts else "Unknown"
+
+
+class Q628State(Enum):
+    """Q628 state machine states"""
+    POWER_UP = auto()      # Initial power-up state
+    STARTUP = auto()       # System startup
+    PRE_IDLE = auto()      # Preparing for idle
+    IDLE = auto()          # System idle, waiting for commands
+    WAIT_START_SW = auto() # Waiting for start switch
+    WAIT_HV = auto()       # Waiting for HV stabilization
+    START = auto()         # Starting measurement
+    PRE_ACTIV = auto()     # Preparing for active measurement
+    ACTIV = auto()         # Active measurement
+    FINISH = auto()        # Finishing measurement
+
+
+# ===== Global State and Synchronization =====
+class SystemState:
+    """Thread-safe system state container"""
+    def __init__(self):
+        self._state = {
+            "motor_position": MotorPosition.UNKNOWN,
+            "motor_status": MotorStatus.NONE,
+            "motor_status_raw": 0,
+            "valve_status": ValveStatus.UNKNOWN,
+            "hv_status": False,
+            "cycle_count": 0,
+            "last_error": None,
+            "last_ip": "0.0.0.0",
+            "connected_clients": 0,
+            "measurement_active": False,
+            "sampling_active": False,  # New flag for sampling status
+            "start_time": time.time(),
+            "measurement_start_time": None,
+            "button_press_time": None,
+            "defined_measurement_time": 60,  # Default measurement time in seconds
+            "q628_state": Q628State.POWER_UP,
+            "q628_timer": time.time(),
+            "profile_hin": 4,         # Default profile for movement
+            "profile_zurueck": 4,     # Default profile for return
+            "wait_acdc": 11,          # Default wait time for AC/DC
+            "temperature": 23.5,      # Default temperature in °C
+            "humidity": 45.0,         # Default humidity in %
+            "field_strength": 0.0,    # Field strength
+            "hv_ac_value": 230,       # Default HV AC value
+            "hv_dc_value": 6500,      # Default HV DC value
+            "adc_data": [],           # ADC measurement data
+            "last_adc_value": 0,      # Last ADC value read
+            "runtime": 0              # Measurement runtime
+        }
+        self._lock = threading.RLock()
+        self._runtime_timer = None  # Timer for updating runtime
+
+    def get_measurement_runtime(self) -> int:
+        """
+        Calculate elapsed time since measurement start (button press)
+        """
+        with self._lock:
+            if not self._state["measurement_active"] or self._state["button_press_time"] is None:
+                return 0
+            return int(time.time() - self._state["button_press_time"])
+
+    def is_measurement_time_elapsed(self) -> bool:
+        """
+        Check if the defined measurement time has elapsed.
+        Compares against the dynamically set measurement time from Delphi.
+        """
+        with self._lock:
+            if not self._state["measurement_active"] or self._state["button_press_time"] is None:
+                return False
+            elapsed = time.time() - self._state["button_press_time"]
+            defined_time = self._state["defined_measurement_time"]
+            return elapsed >= defined_time
+    def update(self, **kwargs) -> None:
+        """Thread-safe update of multiple state attributes with runtime limit enforcement"""
+        with self._lock:
+            self._state.update(kwargs)
+            
+            # CRITICAL: Add runtime cap enforcer
+            # If we have an active measurement, ensure runtime never exceeds defined time
+            if (self._state["measurement_active"] and 
+                self._state["button_press_time"] is not None and 
+                "runtime" in self._state):
+                
+                defined_time = self._state["defined_measurement_time"]
+                if self._state["runtime"] > defined_time:
+                    self._state["runtime"] = defined_time
+                    logger.debug(f"⚠️ Runtime capped at {defined_time}s by setter")
+
+    def get(self, key: str) -> Any:
+        """Thread-safe state access"""
+        with self._lock:
+            return self._state.get(key)
+
+    def set(self, key: str, value: Any) -> None:
+        """Thread-safe state update"""
+        with self._lock:
+            self._state[key] = value
+
+    def update(self, **kwargs) -> None:
+        """Thread-safe update of multiple state attributes"""
+        with self._lock:
+            self._state.update(kwargs)
+
+    def is_measurement_active(self) -> bool:
+        """Check if measurement is active"""
+        with self._lock:
+            return self._state["measurement_active"]
+
+    def is_sampling_active(self) -> bool:
+        """Check if sampling is active"""
+        with self._lock:
+            return self._state["sampling_active"]
+
+    def set_button_press_time(self) -> None:
+        """
+        Set button press time to current time
+        """
+        with self._lock:
+            self._state["button_press_time"] = time.time()
+            logger.info(f"🕒 Button press time set to: {self._state['button_press_time']}")
+
+    def start_sampling(self) -> None:
+        """Enable sampling flag"""
+        with self._lock:
+            self._state["sampling_active"] = True
+            logger.info("📊 Sampling activated")
+
+    def stop_sampling(self) -> None:
+        """Disable sampling flag"""
+        with self._lock:
+            self._state["sampling_active"] = False
+            logger.info("📊 Sampling deactivated")
+
+    def start_measurement(self) -> bool:
+        """Start measurement with explicit sample rate control"""
+        with self._lock:
+            if self._state["measurement_active"]:
+                return False
+            self._state["measurement_active"] = True
+            self._state["measurement_start_time"] = time.time()
+            self._state["runtime"] = 0
+            self._state["points_per_second"] = 50  # Make sure this matches Delphi setting
+            
+            # Clear buffer at start of measurement
+            adc_buffer.clear()
+            
+            # Start runtime update timer
+            self._start_runtime_timer()
+            
+            logger.info(f"🕒 Measurement started at: {self._state['measurement_start_time']} " +
+                    f"with {self._state['points_per_second']} samples/second for {self._state['defined_measurement_time']}s")
+            return True
+
+    def _start_runtime_timer(self) -> None:
+        """Start timer to update runtime field with respect to configured time limit"""
+        if self._runtime_timer is not None:
+            return
+
+        def update_runtime():
+            while self._state["measurement_active"]:
+                with self._lock:
+                    if self._state["button_press_time"] is not None:
+                        elapsed = time.time() - self._state["button_press_time"]
+                        # Use the configured measurement time from Delphi
+                        defined_time = self._state["defined_measurement_time"]
+                        
+                        # Cap runtime at defined time
+                        self._state["runtime"] = min(int(elapsed), defined_time)
+                        
+                        # Force state transition if time exceeded
+                        if elapsed >= defined_time and self._state["q628_state"] == Q628State.ACTIV:
+                            logger.info(f"⏱️ Runtime timer detected end of measurement ({defined_time}s)")
+                            self._state["q628_state"] = Q628State.FINISH
+                            self._state["q628_timer"] = time.time()
+                
+                time.sleep(0.02)  # Check 50 times per second for more precision
+
+        self._runtime_timer = threading.Thread(target=update_runtime, daemon=True)
+        self._runtime_timer.start()
+    
+
+    def end_measurement(self) -> None:
+        """End measurement"""
+        with self._lock:
+            self._state["measurement_active"] = False
+            self._state["measurement_start_time"] = None
+            self._state["button_press_time"] = None
+            self._state["runtime"] = 0
+            logger.info("🕒 Measurement ended")
+
+    def increment_cycle_count(self) -> int:
+        """Increment cycle counter and return new value"""
+        with self._lock:
+            self._state["cycle_count"] += 1
+            return self._state["cycle_count"]
+
+    def increment_clients(self) -> int:
+        """Increment connected clients counter"""
+        with self._lock:
+            self._state["connected_clients"] += 1
+            return self._state["connected_clients"]
+
+    def decrement_clients(self) -> int:
+        """Decrement connected clients counter"""
+        with self._lock:
+            self._state["connected_clients"] = max(0, self._state["connected_clients"] - 1)
+            return self._state["connected_clients"]
+
+    def get_runtime(self) -> int:
+        """Get runtime in seconds since start"""
+        return int(time.time() - self._state["start_time"])
+
+    def get_status_dict(self) -> Dict[str, Any]:
+        """Get a copy of the entire state dictionary"""
+        with self._lock:
+            return self._state.copy()
+
+    def update_motor_status(self, status: MotorStatus, raw_status: int) -> None:
+        """Update motor status information"""
+        with self._lock:
+            self._state["motor_status"] = status
+            self._state["motor_status_raw"] = raw_status
+
+            # Update motor position based on status if possible
+            if status & MotorStatus.HOME:
+                self._state["motor_position"] = MotorPosition.UP
+
+    def set_q628_state(self, new_state: Q628State) -> None:
+        """Update Q628 state machine state"""
+        with self._lock:
+            old_state = self._state["q628_state"]
+            self._state["q628_state"] = new_state
+            self._state["q628_timer"] = time.time()
+            if old_state != new_state:
+                logger.info(f"🔄 Q628 State changed: {old_state.name} -> {new_state.name}")
+
+    def get_q628_state(self) -> Q628State:
+        """Get current Q628 state"""
+        with self._lock:
+            return self._state["q628_state"]
+
+    def get_q628_elapsed(self) -> float:
+        """Get elapsed time in current Q628 state"""
+        with self._lock:
+            return time.time() - self._state["q628_timer"]
+
+    def add_adc_data(self, value: int) -> None:
+        """Add ADC data to the measurement array"""
+        with self._lock:
+            # Update last ADC value
+            self._state["last_adc_value"] = value
+            
+            if len(self._state["adc_data"]) < 50:  # Keep max 50 values for TCP response
+                self._state["adc_data"].append(value)
+            else:
+                self._state["adc_data"] = self._state["adc_data"][1:] + [value]
+
+    def clear_adc_data(self) -> None:
+        """Clear ADC measurement data"""
+        with self._lock:
+            self._state["adc_data"] = []
+
+    def get_profile_delay(self, profile_id: int) -> float:
+        """Get delay time for specified profile"""
+        return Config.PROFILE_DELAYS.get(profile_id, Config.DEFAULT_PROFILE_DELAY)
+
+
+# ===== Ring Buffer for ADC Data =====
+class RingBuffer:
+    """Circular buffer for ADC samples"""
+
+    def __init__(self, size: int):
+        self.buffer = deque(maxlen=size)
+        self.lock = threading.Lock()
+
+    def get_all(self) -> List[int]:
+        """Get all values as list without removing them"""
+        with self.lock:
+            return list(self.buffer)
+
+    def enqueue(self, value: int) -> None:
+        """Add value to buffer"""
+        with self.lock:
+            self.buffer.append(value)
+
+    def dequeue(self) -> Optional[int]:
+        """Remove and return oldest value"""
+        with self.lock:
+            return None if self.is_empty() else self.buffer.popleft()
+
+    def is_empty(self) -> bool:
+        """Check if buffer is empty"""
+        with self.lock:
+            return len(self.buffer) == 0
+
+    def is_full(self) -> bool:
+        """Check if buffer is full"""
+        with self.lock:
+            return len(self.buffer) == self.buffer.maxlen
+
+    def clear(self) -> None:
+        """Clear all values"""
+        with self.lock:
+            self.buffer.clear()
+
+    def __len__(self) -> int:
+        """Get current buffer size"""
+        with self.lock:
+            return len(self.buffer)
+
+
+# ===== Global Variables =====
+system_state = SystemState()
+measurement_start_time = 0
+i2c_bus = None  # Will be initialized in hardware setup
+adc_buffer = RingBuffer(Config.ADC_BUFFER_SIZE)  # Larger buffer matching C code
+
+# Synchronization primitives
+i2c_lock = threading.Lock()
+adc_lock = threading.Lock()
+dac_lock = threading.Lock()
+shutdown_requested = threading.Event()
+enable_from_pc = threading.Event()
+simulate_start = threading.Event()
+sampling_active = threading.Event()
+continuous_sampling_active = threading.Event()  # Für kontinuierliches Abtasten
+
+# Setup logging
+logger = logging.getLogger("qumat628")
+
+
+# ===== Logging Setup =====
+def setup_logging() -> None:
+    """Configure logging to both file and console with proper formatting"""
+    logger.setLevel(logging.INFO)
+
+    # Create formatters
+    console_format = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    file_format = logging.Formatter(
+        '%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(console_format)
+    logger.addHandler(console_handler)
+
+    # File handler
+    try:
+        file_handler = logging.FileHandler(Config.LOG_FILE, mode='a')
+        file_handler.setFormatter(file_format)
+        logger.addHandler(file_handler)
+
+        # Log startup message
+        logger.info("\n\n--- QUMAT628 System Starting: %s ---",
+                    datetime.datetime.now().isoformat())
+    except Exception as e:
+        logger.warning("Could not set up file logging: %s", e)
+
+
+# ===== Hardware Control Functions =====
+def initialize_hardware() -> bool:
+    """Initialize hardware with comprehensive error checking"""
+    logger.info("🔌 Initializing hardware...")
+
+    try:
+        global i2c_bus
+        i2c_bus = smbus2.SMBus(1)
+
+        # Configure GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+
+        # Setup output pins
+        output_pins = [
+            Config.PIN_CS_ADC, Config.PIN_CLK_ADC, Config.PIN_DAT_DAC,
+            Config.PIN_CLK_DAC, Config.PIN_CS_DAC, Config.MAGNET1_GPIO,
+            Config.MAGNET2_GPIO, Config.START_LED_GPIO, Config.HVAC_GPIO
+        ]
+
+        for pin in output_pins:
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.LOW)  # Initialize all outputs to LOW
+
+        # Setup input pins with pull-up resistors
+        GPIO.setup(Config.PIN_SDO_ADC, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(Config.START_TASTE_GPIO, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        # Set initial pin states for SPI-like interfaces
+        GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)  # Chip select inactive
+        GPIO.output(Config.PIN_CLK_ADC, GPIO.LOW)
+        GPIO.output(Config.PIN_CS_DAC, GPIO.HIGH)  # Chip select inactive
+        GPIO.output(Config.PIN_CLK_DAC, GPIO.LOW)
+        GPIO.output(Config.PIN_DAT_DAC, GPIO.LOW)
+
+        # Test I2C connection to motor controller
+        try:
+            with i2c_lock:
+                i2c_bus.read_byte(Config.I2C_ADDR_MOTOR)
+            logger.info("✅ Motor I2C connection successfully tested")
+
+            # Read initial motor status
+            motor_status = read_motor_status()
+            if motor_status:
+                logger.info("✅ Initial motor status: %s", motor_status)
+        except Exception as e:
+            logger.warning("⚠️ Motor I2C connection test failed: %s", e)
+
+        # Test I2C connection to humidity/temperature sensor
+        try:
+            with i2c_lock:
+                i2c_bus.read_byte(Config.HYT_ADDR)
+            logger.info("✅ HYT sensor I2C connection successfully tested")
+        except Exception as e:
+            logger.warning("⚠️ HYT sensor I2C connection test failed: %s", e)
+
+        # Start motor status monitoring thread
+        threading.Thread(
+            target=motor_status_monitor,
+            daemon=True
+        ).start()
+        logger.info("✅ Motor status monitoring started")
+
+        # Start continuous ADC sampling for field strength
+        continuous_sampling_active.set()
+        threading.Thread(
+            target=continuous_adc_sampling_thread,
+            daemon=True
+        ).start()
+        logger.info("✅ Continuous ADC sampling for field strength started")
+
+        # Start regular ADC sampling thread (for measurements)
+        threading.Thread(
+            target=adc_sampling_thread,
+            daemon=True
+        ).start()
+        logger.info("✅ ADC sampling thread started")
+
+        # Start temperature/humidity monitoring
+        threading.Thread(
+            target=temperature_humidity_monitor,
+            daemon=True
+        ).start()
+        logger.info("✅ Temperature and humidity monitoring started")
+
+        # Start Q628 state machine thread
+        threading.Thread(
+            target=q628_state_machine,
+            daemon=True
+        ).start()
+        logger.info("✅ Q628 state machine started")
+
+        # Start LED control thread
+        threading.Thread(
+            target=led_control_thread,
+            daemon=True
+        ).start()
+        logger.info("✅ LED status indication started")
+
+        logger.info("✅ Hardware initialization completed successfully")
+        return True
+
+    except Exception as e:
+        logger.error("❌ Hardware initialization failed: %s", e, exc_info=True)
+        return False
+
+
+def temperature_humidity_monitor() -> None:
+    """
+    Continuously monitor temperature and humidity
+    and update system state.
+    """
+    logger.info("🌡️ Temperature and humidity monitoring started")
+
+    while not shutdown_requested.is_set():
+        try:
+            # Read temperature and humidity
+            temp, humidity = read_temperature_humidity()
+            logger.debug(f"Temperature: {temp:.1f}°C, Humidity: {humidity:.1f}%")
+            
+            # Log values periodically (every minute)
+            if int(time.time()) % 60 == 0:
+                logger.info(f"🌡️ Temperature: {temp:.1f}°C, Humidity: {humidity:.1f}%")
+
+        except Exception as e:
+            logger.error(f"❌ Error reading temperature/humidity: {e}")
+
+        # Wait for the defined interval
+        time.sleep(Config.TEMP_HUMID_SAMPLE_INTERVAL)
+
+    logger.info("🌡️ Temperature and humidity monitoring terminated")
+
+
+def continuous_adc_sampling_thread() -> None:
+    """
+    Thread for continuous ADC sampling for field strength, independent of normal sampling.
+    Runs always, even when no measurement is active.
+    """
+    logger.info("📊 Continuous ADC sampling for field strength started")
+    sample_count = 0
+
+    while not shutdown_requested.is_set():
+        try:
+            if continuous_sampling_active.is_set():
+                # Not sampling too frequently to save CPU
+                time.sleep(0.5)
+
+                # Read ADC
+                voltage, raw_value = read_adc()
+
+                # Calculate field strength and store in system state
+                field_strength = convert_adc_to_kv(raw_value)
+                system_state.set("field_strength", field_strength)
+                system_state.set("last_adc_value", raw_value)
+
+                # Logging once every 10 seconds
+                sample_count += 1
+                if sample_count % 20 == 0:  # At 0.5s interval = approx. every 10s
+                    logger.info(f"Field strength: {field_strength:.2f} kV/cm (ADC: {raw_value})")
+        except Exception as e:
+            logger.error(f"❌ Error in continuous ADC sampling: {e}")
+            time.sleep(1.0)  # Longer pause on errors
+
+
+def get_current_ip() -> str:
+    """Get current IP address with error handling and fallback"""
+    try:
+        # Try to get IP from hostname command
+        output = subprocess.check_output("hostname -I", shell=True)
+        ip_addresses = output.decode().strip().split()
+
+        if ip_addresses:
+            # Filter out localhost and IPv6 addresses
+            valid_ips = [ip for ip in ip_addresses
+                         if ip != "127.0.0.1" and ":" not in ip]
+
+            if valid_ips:
+                ip = valid_ips[0]  # Take first valid IP
+                logger.info("🌐 Current IP (DHCP): %s", ip)
+                system_state.set("last_ip", ip)
+                return ip
+
+        # Fallback: try socket method
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # This doesn't actually establish a connection
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            logger.info("🌐 Current IP (socket method): %s", ip)
+            system_state.set("last_ip", ip)
+            return ip
+
+    except Exception as e:
+        logger.error("❌ Could not determine IP address: %s", e)
+        return "0.0.0.0"
+
+
+def wait_for_button(msg: str, timeout: Optional[float] = None) -> bool:
+    """
+    Wait for button press with timeout and debouncing
+
+    Args:
+        msg: Message to log while waiting
+        timeout: Optional timeout in seconds
+
+    Returns:
+        True if button was pressed, False if timeout or shutdown requested
+    """
+    logger.info("⏳ %s (waiting for button press)...", msg)
+
+    start_time = time.time()
+    debounce_time = Config.BUTTON_DEBOUNCE_TIME
+
+    # Wait for button press (HIGH to LOW transition)
+    while GPIO.input(Config.START_TASTE_GPIO) == GPIO.HIGH:
+        if shutdown_requested.is_set():
+            return False
+        if timeout and (time.time() - start_time > timeout):
+            logger.info("⏰ Timeout waiting for button press (%ss)", timeout)
+            return False
+        time.sleep(Config.BUTTON_POLL_INTERVAL)
+
+    # Button pressed - debounce
+    time.sleep(debounce_time)
+    if GPIO.input(Config.START_TASTE_GPIO) == GPIO.HIGH:
+        # False trigger
+        return wait_for_button(msg, timeout)
+
+    logger.info("👇 Button pressed")
+
+    # Set button press time for timer calculation
+    system_state.set_button_press_time()
+
+    # Wait for button release (LOW to HIGH transition)
+    while GPIO.input(Config.START_TASTE_GPIO) == GPIO.LOW:
+        if shutdown_requested.is_set():
+            return False
+        time.sleep(Config.BUTTON_POLL_INTERVAL)
+
+    # Button released - debounce
+    time.sleep(debounce_time)
+    logger.info("👆 Button released")
+    return True
+
+
+def blink_led(mode: str = "slow", duration: float = 3.0) -> None:
+    """
+    Blink LED with specified pattern
+
+    Args:
+        mode: "slow" or "fast" blinking
+        duration: How long to blink in seconds
+    """
+    interval = (Config.LED_BLINK_FAST if mode == "fast"
+                else Config.LED_BLINK_SLOW)
+
+    logger.debug("💡 LED blinking %s for %.1fs...", mode, duration)
+
+    try:
+        end_time = time.time() + duration
+
+        while time.time() < end_time and not shutdown_requested.is_set():
+            GPIO.output(Config.START_LED_GPIO, GPIO.HIGH)
+            time.sleep(interval)
+            if shutdown_requested.is_set():
+                break
+            GPIO.output(Config.START_LED_GPIO, GPIO.LOW)
+            time.sleep(interval)
+    except Exception as e:
+        logger.error("❌ Error during LED blinking: %s", e)
+    finally:
+        # Ensure LED is off when done
+        try:
+            GPIO.output(Config.START_LED_GPIO, GPIO.LOW)
+        except:
+            pass
+
+
+def led_control_thread() -> None:
+    """
+    Control LED status indication based on system state.
+
+    LED patterns:
+    - Slow blink: System initializing or shutting down
+    - Solid on: Ready to start (after 'S' command)
+    - Fast blink: Measurement in progress (after button press)
+    """
+    logger.info("💡 LED control thread started")
+
+    led_state = False
+    shutdown_blink_count = 0  # Limited number of blinks during shutdown
+
+    while not shutdown_requested.is_set():
+        try:
+            current_state = system_state.get_q628_state()
+            measurement_active = system_state.is_measurement_active()
+            
+            # Check if waiting for button press (after 'S' command)
+            waiting_for_button = (current_state == Q628State.WAIT_START_SW)
+
+            if current_state in [Q628State.POWER_UP, Q628State.STARTUP, Q628State.PRE_IDLE]:
+                # Slow blinking during initialization
+                blink_pattern = Config.LED_BLINK_SLOW
+                led_state = not led_state
+                GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
+                time.sleep(blink_pattern)
+            elif waiting_for_button:
+                # Solid on when waiting for button press
+                GPIO.output(Config.START_LED_GPIO, GPIO.HIGH)
+                led_state = True
+                time.sleep(0.1)
+            elif measurement_active:
+                # Fast blinking during measurement
+                blink_pattern = Config.LED_BLINK_FAST
+                led_state = not led_state
+                GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
+                time.sleep(blink_pattern)
+            else:
+                # Slow blinking in all other states
+                blink_pattern = Config.LED_BLINK_SLOW
+                led_state = not led_state
+                GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
+                time.sleep(blink_pattern)
+
+        except Exception as e:
+            logger.error("❌ Error in LED control thread: %s", e)
+            try:
+                GPIO.output(Config.START_LED_GPIO, GPIO.HIGH)  # Error fallback - constant on
+                led_state = True
+            except:
+                pass
+            time.sleep(1.0)
+
+    # Blink during shutdown (limited number)
+    try:
+        while shutdown_blink_count < 10:  # Maximum 10 blinks during shutdown
+            led_state = not led_state
+            GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
+            time.sleep(Config.LED_BLINK_SLOW)
+            shutdown_blink_count += 1
+        
+        # Ensure LED is off at the end
+        GPIO.output(Config.START_LED_GPIO, GPIO.LOW)
+    except:
+        # Ensure LED is off if interrupted
+        try:
+            GPIO.output(Config.START_LED_GPIO, GPIO.LOW)
+        except:
+            pass
+
+    logger.info("💡 LED control thread terminated")
+
+
+def set_valve(status: ValveStatus) -> None:
+    """
+    Set valve status (open/closed)
+
+    Args:
+        status: ValveStatus.OPEN or ValveStatus.CLOSED
+    """
+    status_str = str(status)
+    logger.info("🔧 Setting valve: %s", status_str.upper())
+
+    try:
+        system_state.set("valve_status", status)
+
+        # Both magnets are controlled together
+        gpio_state = GPIO.HIGH if status == ValveStatus.OPEN else GPIO.LOW
+        GPIO.output(Config.MAGNET1_GPIO, gpio_state)
+        GPIO.output(Config.MAGNET2_GPIO, gpio_state)
+    except Exception as e:
+        logger.error("❌ Error setting valve: %s", e)
+        system_state.set("last_error", f"Valve error: {str(e)}")
+
+
+def read_motor_status() -> Optional[MotorStatus]:
+    """
+    Read motor status via I2C with improved error handling
+    """
+    try:
+        with i2c_lock:
+            # First send passive mode command with proper timing
+            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, Config.CMD_PASSIV)
+            time.sleep(0.05)  # Increased delay for stability
+
+            # Then send status request command
+            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, Config.CMD_STATUS)
+            time.sleep(0.05)  # Increased delay for stability
+
+            # Read status byte
+            status_byte = i2c_bus.read_byte(Config.I2C_ADDR_MOTOR)
+            
+            # Log raw status for debugging
+            logger.debug(f"Raw motor status byte: 0x{status_byte:02X} (binary: {bin(status_byte)[2:].zfill(8)})")
+
+        # Convert to MotorStatus object
+        status = MotorStatus.from_byte(status_byte)
+
+        # Update system state
+        system_state.update_motor_status(status, status_byte)
+
+        return status
+    except Exception as e:
+        logger.error("❌ Error reading motor status: %s", e)
+        return None
+
+
+def motor_status_monitor() -> None:
+    """
+    Continuously monitor motor status in a separate thread
+    """
+    logger.info("🔄 Motor status monitoring started")
+    error_logged = False  # Track if we've already logged an error
+    last_status = None
+
+    while not shutdown_requested.is_set():
+        try:
+            status = read_motor_status()
+            if status:
+                # Log full status periodically
+                if status != last_status:
+                    logger.debug("Motor status changed: %s", status)
+                    last_status = status
+
+                # If motor is in error state, log it (but avoid spamming logs)
+                if status & MotorStatus.ERROR:
+                    if not error_logged:
+                        logger.warning("⚠️ Motor error detected! Status: %s", status)
+                        error_logged = True
+                else:
+                    # Reset the error logged flag when error clears
+                    error_logged = False
+
+                # If motor just reached home position, log it
+                prev_status = system_state.get("motor_status")
+                if (status & MotorStatus.HOME) and not (prev_status & MotorStatus.HOME):
+                    logger.info("🏠 Motor reached home position")
+
+                # If motor just finished being busy, log it
+                if (prev_status & MotorStatus.BUSY) and not (status & MotorStatus.BUSY):
+                    logger.info("✅ Motor operation completed")
+        except Exception as e:
+            logger.error("❌ Error in motor status monitor: %s", e)
+
+        # Sleep before next poll
+        time.sleep(Config.MOTOR_STATUS_POLL_INTERVAL)
+
+
+def move_motor(position: MotorPosition) -> bool:
+    """
+    Move motor to specified position
+
+    Args:
+        position: MotorPosition.UP or MotorPosition.DOWN
+
+    Returns:
+        True if successful, False if error occurred
+    """
+    position_str = str(position)
+    logger.info("🛠️ Moving motor: %s", position_str.upper())
+
+    try:
+        system_state.set("motor_position", position)
+
+        # Check current motor status
+        status = read_motor_status()
+        if status and (status & MotorStatus.BUSY):
+            logger.warning("⚠️ Motor is busy, waiting before sending new command")
+            # Wait for motor to be ready (up to 5 seconds)
+            for _ in range(50):  # 50 * 0.1s = 5s
+                if shutdown_requested.is_set():
+                    return False
+                time.sleep(0.1)
+                status = read_motor_status()
+                if status and not (status & MotorStatus.BUSY):
+                    break
+            else:
+                logger.error("❌ Motor still busy after timeout, forcing command")
+
+        # Send appropriate command to motor controller
+        cmd = Config.CMD_UP if position == MotorPosition.UP else Config.CMD_DOWN
+        with i2c_lock:
+            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, cmd)
+
+        # Wait briefly and check if command was accepted
+        time.sleep(0.1)
+        status = read_motor_status()
+        if status and (status & MotorStatus.BUSY):
+            logger.info("✅ Motor command accepted, motor is now busy")
+            return True
+        else:
+            logger.warning("⚠️ Motor command may not have been accepted")
+            return True  # Still return True as we did send the command
+    except Exception as e:
+        logger.error("❌ Error moving motor: %s", e)
+        system_state.set("last_error", f"Motor error: {str(e)}")
+        return False
+
+
+def set_high_voltage(enabled: bool) -> None:
+    """
+    Enable or disable high voltage
+
+    Args:
+        enabled: True to enable, False to disable
+    """
+    status_text = 'ON' if enabled else 'OFF'
+    logger.info("⚡ High voltage: %s", status_text)
+
+    try:
+        system_state.set("hv_status", enabled)
+        GPIO.output(Config.HVAC_GPIO, GPIO.HIGH if enabled else GPIO.LOW)
+    except Exception as e:
+        logger.error("❌ Error setting high voltage: %s", e)
+        system_state.set("last_error", f"HV error: {str(e)}")
+
+
+def read_temperature_humidity() -> Tuple[float, float]:
+    """
+    Read temperature and humidity from HYT sensor
+
+    Returns:
+        Tuple of (temperature in °C, humidity in %)
+    """
+    try:
+        # Start measurement
+        with i2c_lock:
+            i2c_bus.write_byte(Config.HYT_ADDR, 0x00)
+        time.sleep(0.1)  # Wait for measurement
+
+        # Read 4 bytes of data
+        with i2c_lock:
+            data = i2c_bus.read_i2c_block_data(Config.HYT_ADDR, 0, 4)
+
+        # First two bytes: humidity (14 bits)
+        # Last two bytes: temperature (14 bits)
+        humidity_raw = ((data[0] & 0x3F) << 8) | data[1]
+        temp_raw = (data[2] << 6) | (data[3] >> 2)
+
+        # Convert to physical values
+        humidity = (humidity_raw / 16383.0) * 100.0
+        temp = (temp_raw / 16383.0) * 165.0 - 40.0
+
+        # Update system state
+        system_state.update(temperature=temp, humidity=humidity)
+
+        return (temp, humidity)
+    except Exception as e:
+        logger.error("❌ Error reading temperature/humidity: %s", e)
+        return (23.5, 45.0)  # Return default values on error
+
+
+# ===== ADC/DAC Functions =====
+def read_adc_24bit() -> Tuple[float, int]:
+    """
+    Read 24-bit signed value from external ADC via SPI interface.
+    """
+    with adc_lock:
+        try:
+            # Start conversion by bringing CS low
+            GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
+
+            # Wait for ADC conversion to complete (SDO goes LOW)
+            timeout = time.time() + 1.0  # 1 second timeout
+            while GPIO.input(Config.PIN_SDO_ADC) == GPIO.HIGH:
+                if time.time() > timeout:
+                    GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
+                    logger.error("ADC conversion timeout")
+                    return 0.0, 0
+                time.sleep(0.001)
+
+            # Read 24 bits from the ADC (MSB first)
+            raw_value = 0
+            for bit_pos in range(23, -1, -1):  # 23 down to 0
+                GPIO.output(Config.PIN_CLK_ADC, GPIO.HIGH)
+                time.sleep(Config.ADC_CLK_DELAY)
+
+                # Read bit value
+                bit = GPIO.input(Config.PIN_SDO_ADC)
+                if bit:
+                    raw_value |= (1 << bit_pos)
+
+                GPIO.output(Config.PIN_CLK_ADC, GPIO.LOW)
+                time.sleep(Config.ADC_CLK_DELAY)
+
+            # End conversion by bringing CS high
+            GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
+
+            # Convert to signed value (two's complement)
+            if raw_value & (1 << 23):  # Check if sign bit is set
+                raw_value -= (1 << 24)
+
+            # Convert to voltage based on ADC reference
+            voltage = (raw_value / (1 << 23)) * Config.VREF_ADC
+
+            return voltage, raw_value
+        except Exception as e:
+            logger.error("❌ SPI ADC read error: %s", e, exc_info=True)
+            GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)  # Ensure CS is high on error
+            return 0.0, 0
+
+
+def read_adc() -> Tuple[float, int]:
+    """
+    Read ADC value using SPI communication with external 24-bit ADC.
+    """
+    return read_adc_24bit()
+
+
+def convert_adc_to_kv(adc_value: int) -> float:
+    """
+    Convert ADC value to field strength, preserving sign.
+    """
+    # Convert signed 24-bit value to signed integer
+    if adc_value & (1 << 23):  # Check if sign bit is set
+        adc_value -= (1 << 24)
+    
+    # Apply a much smaller scaling factor
+    # Try this value and adjust as needed
+    voltage = (adc_value / (1 << 23)) * Config.VREF_ADC
+    return voltage * 0.1  # Much smaller scaling factor
+
+def set_dac(value: int) -> None:
+    """
+    Set DAC value using bit-banged SPI
+    """
+    with dac_lock:
+        try:
+            # Ensure value is 16-bit
+            value &= 0xFFFF
+
+            # Start transmission
+            GPIO.output(Config.PIN_CS_DAC, GPIO.LOW)
+            time.sleep(Config.DAC_CLK_DELAY)
+
+            # Send 16 bits MSB first
+            for i in range(15, -1, -1):
+                bit = (value >> i) & 1
+                GPIO.output(Config.PIN_DAT_DAC, bit)
+                GPIO.output(Config.PIN_CLK_DAC, GPIO.HIGH)
+                time.sleep(Config.DAC_CLK_DELAY)
+                GPIO.output(Config.PIN_CLK_DAC, GPIO.LOW)
+                time.sleep(Config.DAC_CLK_DELAY)
+
+            # End transmission
+            GPIO.output(Config.PIN_CS_DAC, GPIO.HIGH)
+        except Exception as e:
+            logger.error("❌ Error setting DAC: %s", e)
+            GPIO.output(Config.PIN_CS_DAC, GPIO.HIGH)  # Ensure CS is high on error
+
+
+def set_dac_voltage(voltage: float) -> None:
+    """
+    Set DAC output voltage
+    """
+    # Calculate DAC value
+    dac_value = int((voltage / Config.VREF_DAC) * 65535)
+    set_dac(dac_value)
+    logger.debug("DAC set to %.3fV (value: %d)", voltage, dac_value)
+
+
+def adc_sampling_thread() -> None:
+    """
+    Thread für ADC-Abtastung mit Simulation einer 100 Hz Abtastrate (10ms).
+    Stellt sicher, dass die volle konfigurierte Zeit abgetastet wird.
+    """
+    logger.info("🔄 ADC sampling thread started")
+    sample_count = 0
+    last_sample_time = 0
+    last_value = 0  # Letzter gelesener Wert zum Duplizieren
+    
+    while not shutdown_requested.is_set():
+        try:
+            if sampling_active.is_set():
+                current_time = time.time()
+                
+                # Wenn dies die erste Probe ist, setze last_sample_time
+                if last_sample_time == 0:
+                    last_sample_time = current_time
+                    logger.info("Starting ADC sampling with simulated 100 samples/second")
+                
+                # Ermittle Button-Press-Zeit und definierte Messzeit
+                button_press_time = system_state.get("button_press_time")
+                defined_time = system_state.get("defined_measurement_time")
+                
+                # WICHTIG: Füge eine kleine Marge hinzu, um sicherzustellen, dass wir die volle Zeit erreichen
+                # Wir sammeln 5% länger als die definierte Zeit
+                adjusted_time = defined_time * 1.05  # 5% Marge
+                
+                # Berechne verstrichene Zeit seit Messbeginn
+                elapsed_time = 0
+                if button_press_time is not None:
+                    elapsed_time = current_time - button_press_time
+                
+                # Stoppe Abtastung, wenn die erweiterte Messzeit erreicht ist
+                if elapsed_time >= adjusted_time:
+                    logger.info(f"⏱️ Sampling stopped at {elapsed_time:.2f}s (defined time: {defined_time}s)")
+                    sampling_active.clear()
+                    system_state.stop_sampling()
+                    
+                    # Logge Anzahl der gesammelten Samples
+                    logger.info(f"Collected total of {sample_count} samples")
+                    continue
+                
+                # Tatsächliches Abtastintervall (16.67ms = 60Hz)
+                actual_sample_interval = 0.01667  
+                
+                # Simuliertes Abtastintervall für Delphi (10ms = 100Hz)
+                simulated_sample_interval = 0.01
+                
+                # Präzise Zeit seit letzter tatsächlicher Abtastung
+                time_since_last_sample = current_time - last_sample_time
+                
+                # Abtasten mit tatsächlichem Intervall
+                if time_since_last_sample >= actual_sample_interval:
+                    # ADC lesen
+                    voltage, raw_value = read_adc()
+                    last_value = raw_value  # Speichern für Duplikation
+                    
+                    # In Ring-Puffer speichern für jeden simulierten Zeitpunkt
+                    # Berechne, wie viele 10ms-Intervalle in unser 16.67ms-Intervall passen
+                    # Ca. 1.67 simulierte Samples pro tatsächlichem Sample
+                    simulated_samples = round(actual_sample_interval / simulated_sample_interval)
+                    
+                    for _ in range(simulated_samples):
+                        # In Puffer speichern
+                        adc_buffer.enqueue(raw_value)
+                        
+                        # System-Status aktualisieren (nur einmal)
+                        if _ == 0:
+                            system_state.add_adc_data(raw_value)
+                        
+                        # Zähler erhöhen
+                        sample_count += 1
+                    
+                    # Feldstärke berechnen
+                    field_strength = convert_adc_to_kv(raw_value)
+                    system_state.set("field_strength", field_strength)
+                    
+                    # Nächsten tatsächlichen Abtastzeitpunkt präzise berechnen
+                    last_sample_time += actual_sample_interval
+                    
+                    # Prüfen ob wir hinterherhinken, falls ja anpassen
+                    if current_time - last_sample_time > actual_sample_interval:
+                        last_sample_time = current_time
+                    
+                    # Logge jede Sekunde (ca. alle 60 tatsächlichen Abtastungen)
+                    if (sample_count % 100) < simulated_samples:
+                        expected_samples = int(elapsed_time * 100)  # 100 simulierte Samples/Sekunde
+                        logger.info(f"ADC samples: {sample_count}, "
+                                   f"Time={elapsed_time:.2f}s, Expected samples={expected_samples}")
+                
+                # Sehr kurze Schlafzeit für präzises Timing
+                time.sleep(0.001)
+            else:
+                # Sample-Zähler zurücksetzen, wenn keine Abtastung
+                if sample_count > 0:
+                    logger.info(f"ADC sampling stopped after {sample_count} simulated samples")
+                    sample_count = 0
+                    last_sample_time = 0
+                    last_value = 0
+                
+                # Längere Schlafzeit, wenn keine Abtastung
+                time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"❌ Error in ADC sampling thread: {e}")
+            time.sleep(1.0)  # Längere Pause bei Fehler
+
+def start_sampling() -> None:
+    """Start ADC sampling"""
+    logger.info("📊 Starting ADC sampling")
+    adc_buffer.clear()
+    system_state.clear_adc_data()
+    system_state.start_sampling()  # Set sampling active flag in system state
+    sampling_active.set()
+
+
+def stop_sampling() -> None:
+    """Stop ADC sampling"""
+    logger.info("📊 Stopping ADC sampling") 
+    sampling_active.clear()
+    system_state.stop_sampling()  # Clear sampling active flag in system state
+
+
+# ===== Q628 State Machine =====
+
+def q628_state_machine() -> None:
+    """
+    Main Q628 state machine thread - implementiert die Zustandsmaschine gemäß
+    dem spezifizierten Flussdiagramm mit präziser Zeitsteuerung
+    """
+    logger.info("🔄 Q628 state machine started")
+
+    # Initial state
+    system_state.set_q628_state(Q628State.POWER_UP)
+    
+    # Main state machine loop
+    while not shutdown_requested.is_set():
+        try:
+            # Get current state and elapsed time
+            current_state = system_state.get_q628_state()
+            elapsed = system_state.get_q628_elapsed()
+
+            # State machine transitions
+            if current_state == Q628State.POWER_UP:
+                # Initial power-up state
+                if elapsed > 2.0:
+                    # After 2 seconds, transition to STARTUP
+                    system_state.set_q628_state(Q628State.STARTUP)
+
+            elif current_state == Q628State.STARTUP:
+                # System startup - initialize hardware
+                # Disable HV
+                set_high_voltage(False)
+
+                # Open valve
+                set_valve(ValveStatus.OPEN)
+
+                # Move motor to home position
+                move_motor(MotorPosition.UP)
+
+                # Transition to PRE_IDLE
+                system_state.set_q628_state(Q628State.PRE_IDLE)
+
+            elif current_state == Q628State.PRE_IDLE:
+                # Preparing for idle state
+                if elapsed > 3.0:
+                    # After motor has time to move, close valve
+                    set_valve(ValveStatus.CLOSED)
+
+                    # Transition to IDLE
+                    system_state.set_q628_state(Q628State.IDLE)
+
+                    # Blink LED slowly to indicate ready
+                    threading.Thread(
+                        target=blink_led,
+                        args=("slow", 3.0),
+                        daemon=True
+                    ).start()
+
+            elif current_state == Q628State.IDLE:
+                # System idle, waiting for commands
+                # Check if start command received
+                if enable_from_pc.is_set() or simulate_start.is_set():
+                    if simulate_start.is_set():
+                        # Automatic start (simulated button press)
+                        logger.info("✅ Automatic measurement start (simulated)")
+                        simulate_start.clear()
+
+                        # Simulate button press - set timestamp
+                        system_state.set_button_press_time()
+
+                        # Skip waiting for button, go directly to WAIT_HV
+                        system_state.set_q628_state(Q628State.WAIT_HV)
+                    else:
+                        # Manual start (requires button press)
+                        logger.info("✅ Measurement enabled by PC command, waiting for button press")
+                        enable_from_pc.clear()
+
+                        # Turn ON LED steady while waiting for button
+                        GPIO.output(Config.START_LED_GPIO, GPIO.HIGH)
+
+                        # Transition to WAIT_START_SW
+                        system_state.set_q628_state(Q628State.WAIT_START_SW)
+
+            elif current_state == Q628State.WAIT_START_SW:
+                # Waiting for start button press
+                # Check if button pressed
+                if GPIO.input(Config.START_TASTE_GPIO) == GPIO.LOW:
+                    # Button pressed, debounce
+                    time.sleep(Config.BUTTON_DEBOUNCE_TIME)
+                    if GPIO.input(Config.START_TASTE_GPIO) == GPIO.LOW:
+                        logger.info("👇 Button pressed, starting measurement")
+
+                        # Important: Store button press time
+                        system_state.set_button_press_time()
+
+                        # Transition to WAIT_HV
+                        system_state.set_q628_state(Q628State.WAIT_HV)
+
+                # Check for timeout (2 minutes)
+                if elapsed > 120.0:
+                    logger.warning("⏰ Timeout waiting for button press")
+                    GPIO.output(Config.START_LED_GPIO, GPIO.LOW)
+
+                    # Return to IDLE
+                    system_state.set_q628_state(Q628State.IDLE)
+
+            elif current_state == Q628State.WAIT_HV:
+                # Enable HV and open valve
+                set_high_voltage(True)
+                set_valve(ValveStatus.OPEN)
+                
+                # Wait for profile delay according to chosen profile
+                profile_hin = system_state.get("profile_hin")
+                wait_time = system_state.get_profile_delay(profile_hin)
+
+                if elapsed > wait_time:
+                    # Transition to START when delay elapses
+                    system_state.set_q628_state(Q628State.START)
+
+            elif current_state == Q628State.START:
+                # Start sampling and measurement
+                # WICHTIG: Vor dem Start des Samplings den ADC-Puffer leeren
+                adc_buffer.clear()
+                system_state.clear_adc_data()
+                
+                start_sampling()  # Sets sampling_active to True
+                system_state.start_measurement()  # Sets measurement_active to True
+                
+                # Move motor down
+                move_motor(MotorPosition.DOWN)
+
+                # Transition to PRE_ACTIV
+                system_state.set_q628_state(Q628State.PRE_ACTIV)
+
+            elif current_state == Q628State.PRE_ACTIV:
+                # Wait for motor movement to complete
+                motor_status = system_state.get("motor_status")
+                
+                if not (motor_status & MotorStatus.BUSY) or elapsed > 5.0:
+                    # Turn OFF High Voltage once motor is in position
+                    set_high_voltage(False)
+
+                    # Transition to ACTIV
+                    system_state.set_q628_state(Q628State.ACTIV)
+
+                    # Log measurement time
+                    measurement_runtime = system_state.get_measurement_runtime()
+                    defined_time = system_state.get("defined_measurement_time")
+                    time_left = max(0, defined_time - measurement_runtime)
+                    logger.info(f"⏱️ Active measurement running for {measurement_runtime}s, {time_left}s left")
+
+            elif current_state == Q628State.ACTIV:
+                # Get precise timing information
+                button_press_time = system_state.get("button_press_time")
+                defined_time = system_state.get("defined_measurement_time")
+                
+                if button_press_time is not None:
+                    elapsed_since_start = time.time() - button_press_time
+                    
+                    # KRITISCH: Füge eine kleine Marge hinzu (5%)
+                    adjusted_time = defined_time * 1.05
+                    
+                    # Ermittle wieviele Samples wir bisher haben
+                    current_samples = len(adc_buffer.get_all())
+                    target_samples = int(defined_time * 100)  # 100 samples/sec
+                    
+                    # Logge den Fortschritt alle Sekunde
+                    if int(elapsed_since_start) % 1 == 0 and int(elapsed_since_start) > 0:
+                        logger.info(f"⏱️ Measurement progress: {elapsed_since_start:.1f}s / {defined_time}s - "
+                                  f"Samples: {current_samples} / {target_samples}")
+                    
+                    # Beende Messung erst, wenn mindestens die definierte Zeit plus Marge UND 
+                    # die Zielanzahl an Samples erreicht ist
+                    if elapsed_since_start >= adjusted_time and current_samples >= target_samples:
+                        logger.info(f"⏱️ Measurement complete: Time={elapsed_since_start:.1f}s / {defined_time}s, "
+                                  f"Samples={current_samples} / {target_samples}")
+                        
+                        # Sofort das Sampling stoppen
+                        stop_sampling()
+                        
+                        # Zum FINISH-Zustand wechseln
+                        system_state.set_q628_state(Q628State.FINISH)
+                
+                # Sehr kurze Schlafzeit für präzises Timing
+                time.sleep(0.001)
+
+            elif current_state == Q628State.FINISH:
+                # Sicherstellen, dass das Sampling gestoppt ist
+                if sampling_active.is_set() or system_state.is_sampling_active():
+                    stop_sampling()
+                    logger.info("Ensuring sampling is stopped")
+                
+                # Motor hochfahren
+                move_motor(MotorPosition.UP)
+
+                # Warten bis Motor oben ist
+                wait_for_motor_home(timeout=10)
+
+                # Ventil schließen
+                set_valve(ValveStatus.CLOSED)
+
+                # Messung beenden
+                system_state.end_measurement()
+
+                # Zurück zu IDLE
+                system_state.set_q628_state(Q628State.IDLE)
+
+            # Kurze Schlafzeit um CPU-Last zu reduzieren
+            # Kurze Schlafzeit für ACTIV, längere für andere Zustände
+            if current_state == Q628State.ACTIV:
+                time.sleep(0.001)  # Sehr reaktionsschnell während aktiver Messung
+            else:
+                time.sleep(0.1)    # Weniger reaktionsschnell für andere Zustände
+
+        except Exception as e:
+            logger.error("❌ Error in Q628 state machine: %s", e, exc_info=True)
+
+            # Sicherheitsmaßnahmen im Fehlerfall
+            try:
+                set_high_voltage(False)
+                set_valve(ValveStatus.CLOSED)
+                stop_sampling()
+                system_state.end_measurement()
+
+                # Nach Fehler zu IDLE zurückkehren
+                system_state.set_q628_state(Q628State.IDLE)
+            except Exception as cleanup_error:
+                logger.error("Error during emergency cleanup: %s", cleanup_error)
+
+            time.sleep(1.0)  # Bei Fehler länger schlafen
+
+def wait_for_motor_home(timeout: float = 10.0) -> bool:
+    """
+    Wait for motor to reach home position
+
+    Args:
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        True if motor reached home, False if timeout or error
+    """
+    logger.info("⏳ Waiting for motor to reach home position (timeout: %.1fs)", timeout)
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        if shutdown_requested.is_set():
+            return False
+
+        status = read_motor_status()
+        if status:
+            # If motor is at home and not busy, we're done
+            if (status & MotorStatus.HOME) and not (status & MotorStatus.BUSY):
+                logger.info("✅ Motor reached home position")
+                return True
+
+            # If motor has error, log and return
+            if status & MotorStatus.ERROR:
+                logger.error("❌ Motor error while waiting for home position")
+                return False
+
+        time.sleep(0.5)  # Check every 500ms
+
+    logger.warning("⏰ Timeout waiting for motor to reach home position")
+    return False
+
+
+# ===== Network Protocol Functions =====
+def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse Delphi-compatible TTCP_CMD packet
+
+    Args:
+        data: Raw bytes from TCP connection
+
+    Returns:        Dictionary with parsed command or None if invalid
+    """
+    try:
+        if len(data) < 32:  # Delphi sends 8 x 4-byte ints = 32 bytes
+            logger.error("Invalid TTCP_CMD size: %d bytes", len(data))
+            return None
+
+        # Unpack 8 integers from the data
+        size, cmd_int, runtime, hvac, hvdc, profile1, profile2, wait_acdc = struct.unpack("<8i", data[:32])
+
+        # Convert command integer to character
+        cmd_char = chr(cmd_int) if 32 <= cmd_int <= 126 else '?'
+        cmd_type = next((c for c in CommandType if c.value == cmd_char), CommandType.UNKNOWN)
+
+        logger.info("Parsed TTCP_CMD: %s (runtime=%ds, HVAC=%d, HVDC=%d, profiles=%d/%d)",
+                    cmd_char, runtime, hvac, hvdc, profile1, profile2)
+
+        # Update system state with received parameters
+        system_state.update(
+            profile_hin=profile1,
+            profile_zurueck=profile2,
+            wait_acdc=wait_acdc,
+            hv_ac_value=hvac,
+            hv_dc_value=hvdc
+        )
+
+        # When receiving START command, set the defined measurement time
+        if cmd_type == CommandType.START:
+            system_state.update(defined_measurement_time=runtime)
+            logger.info(f"📏 Set defined measurement time to {runtime} seconds")
+
+        return {
+            'size': size,
+            'cmd': cmd_char,
+            'cmd_type': cmd_type,
+            'runtime': runtime,
+            'hvac': hvac,
+            'hvdc': hvdc,
+            'profile1': profile1,
+            'profile2': profile2,
+            'wait_acdc': wait_acdc
+        }
+    except Exception as e:
+        logger.error("Error parsing TTCP_CMD: %s", e)
+        return None
+
+
+def build_ttcp_data() -> bytes:
+    """
+    Generiert eine formatierte TTCP_DATA-Antwort für Delphi.
+    Simuliert eine 100Hz Abtastrate (10ms) auch wenn wir tatsächlich nur 
+    60Hz (16.67ms) abtasten können.
+    """
+    try:
+        # System-Status abrufen
+        state_dict = system_state.get_status_dict()
+        defined_time = state_dict["defined_measurement_time"]
+        runtime = state_dict["runtime"]
+        
+        # Puffer für 256 Bytes initialisieren (exakt wie TCP_Data in Delphi)
+        data = bytearray(256)
+
+        # 1. Size (4 Bytes): Größe des Datenpakets
+        struct.pack_into('<i', data, 0, 256)  # Gesamtgröße: 256 Bytes
+
+        # 2. Runtime (4 Bytes): Verstrichene Zeit seit Messbeginn oder 0 wenn inaktiv
+        struct.pack_into('<i', data, 4, runtime)
+
+        # 3. Temperature (4 Bytes): Grad Celsius * 100
+        temp_int = int(state_dict["temperature"] * 100)
+        struct.pack_into('<i', data, 8, temp_int)
+
+        # 4. Humidity (4 Bytes): Feuchtigkeit * 100
+        humidity_int = int(state_dict["humidity"] * 100)
+        struct.pack_into('<i', data, 12, humidity_int)
+
+        # 5. HV_AC (4 Bytes): AC-Spannung in Volt
+        struct.pack_into('<i', data, 16, state_dict["hv_ac_value"])
+
+        # 6. HV_DC (4 Bytes): DC-Spannung in Volt
+        struct.pack_into('<i', data, 20, state_dict["hv_dc_value"])
+
+        # 7. ProfileHin (4 Bytes): Geschwindigkeitsprofil für AC-Entladung
+        struct.pack_into('<i', data, 24, state_dict["profile_hin"])
+
+        # 8. ProfileZurueck (4 Bytes): Geschwindigkeitsprofil für DC-Ladung
+        struct.pack_into('<i', data, 28, state_dict["profile_zurueck"])
+
+        # 9. Wait_ACDC (4 Bytes): Wartezeit zwischen Entladung und Ladung
+        struct.pack_into('<i', data, 32, state_dict["wait_acdc"])
+
+        # 10. SerialNumber (4 Bytes): Seriennummer
+        struct.pack_into('<i', data, 36, Config.SERIAL_NUMBER)
+
+        # 11. Status1 (1 Byte): Statusmeldungen innerhalb Qumat528
+        status1 = 0
+        if state_dict["hv_status"]:
+            status1 |= 0x01  # HV aktiv
+        if state_dict["valve_status"] == ValveStatus.OPEN:
+            status1 |= 0x02  # Ventil offen
+        if state_dict["motor_position"] == MotorPosition.UP:
+            status1 |= 0x04  # Motor oben
+        data[40] = status1
+
+        # 12. Status2 (1 Byte): Statusmeldungen von Qumat528
+        status2 = 0
+        # Bit 0: SafetySwitch (HV-Enable)
+        if state_dict["hv_status"]:
+            status2 |= 0x01
+        
+        # Bit 1: Sampling - Nur setzen wenn Abtastung aktiv
+        if state_dict["sampling_active"]:
+            status2 |= 0x02
+        
+        # Bit 2: Oben (Up)
+        if state_dict["motor_position"] == MotorPosition.UP:
+            status2 |= 0x04
+        
+        # Bit 3: Unten (Down)
+        if state_dict["motor_position"] == MotorPosition.DOWN:
+            status2 |= 0x08
+        
+        # Bit 4: Open
+        if state_dict["valve_status"] == ValveStatus.OPEN:
+            status2 |= 0x10
+        
+        # Bit 6: Close
+        if state_dict["valve_status"] == ValveStatus.CLOSED:
+            status2 |= 0x40
+        
+        # Bit 7: RunHVOff - Setzen wenn Messung aktiv
+        if state_dict["measurement_active"]:
+            status2 |= 0x80
+        
+        data[41] = status2
+
+        # KRITISCH: Berechne die exakte Anzahl der Abtastungen für Delphi
+        # Delphi erwartet 100 Samples/Sekunde (hardcodiert)
+        delphi_samples_per_sec = 100  # 10ms Intervall = 100Hz
+        
+        # Füge 5% Marge hinzu, um sicherzustellen, dass wir genug Samples für die volle Zeit haben
+        max_samples = int(defined_time * delphi_samples_per_sec * 1.05)
+        
+        # ADC-Daten abrufen
+        adc_data = []
+
+        # Daten aus dem Puffer verwenden
+        if not adc_buffer.is_empty():
+            # Alle Proben aus dem Puffer nehmen
+            buffer_data = adc_buffer.get_all()
+            
+            # Wenn Messung aktiv oder kürzlich beendet, genau die richtige Anzahl an Punkten senden
+            if state_dict["measurement_active"] or runtime > 0:
+                # Stellen wir sicher, dass genau die richtige Anzahl von Samples gesendet wird
+                if len(buffer_data) > max_samples:
+                    # Kürzen, wenn wir zu viele Samples haben
+                    buffer_data = buffer_data[:max_samples]
+                    logger.info(f"Begrenze Daten auf {max_samples} Punkte für eine {defined_time}s Messung")
+                elif len(buffer_data) < max_samples:
+                    # Wenn wir zu wenige Punkte haben, füllen wir mit dem letzten Wert auf
+                    if buffer_data:
+                        last_value = buffer_data[-1]
+                        missing_samples = max_samples - len(buffer_data)
+                        logger.info(f"Fülle {missing_samples} fehlende Punkte mit letztem Wert auf")
+                        buffer_data.extend([last_value] * missing_samples)
+                    else:
+                        # Wenn der Puffer leer ist, fügen wir Dummy-Werte hinzu
+                        logger.info(f"Füge {max_samples} Dummy-Punkte hinzu, da Puffer leer ist")
+                        buffer_data = [1000] * max_samples
+            
+            adc_data.extend(buffer_data)
+            logger.debug(f"Verwende {len(buffer_data)} Punkte aus ADC-Puffer")
+        
+        # Auf gespeicherte ADC-Daten zurückgreifen
+        if not adc_data and state_dict["adc_data"]:
+            stored_data = state_dict["adc_data"]
+            # Auch hier die Sample-Begrenzung anwenden
+            if state_dict["measurement_active"] or runtime > 0:
+                if len(stored_data) > max_samples:
+                    stored_data = stored_data[:max_samples]
+                elif len(stored_data) < max_samples:
+                    # Auch hier fehlende Punkte auffüllen
+                    if stored_data:
+                        last_value = stored_data[-1]
+                        missing_samples = max_samples - len(stored_data)
+                        stored_data.extend([last_value] * missing_samples)
+                    else:
+                        # Wenn keine Daten da sind, fügen wir Dummy-Werte hinzu
+                        stored_data = [1000] * max_samples
+            
+            adc_data = stored_data
+            logger.debug(f"Verwende {len(adc_data)} Punkte aus System-Status")
+
+        # Wenn keine Daten verfügbar, den letzten ADC-Wert hinzufügen
+        if not adc_data and state_dict["last_adc_value"] != 0:
+            adc_data.append(state_dict["last_adc_value"])
+            logger.debug("Verwende letzten ADC-Wert")
+
+        # Wenn immer noch keine Daten, einen Dummy-Wert hinzufügen
+        if not adc_data:
+            adc_data.append(1000)  # Dummy-Wert
+            logger.debug("Füge Dummy-ADC-Wert hinzu")
+
+        # 13. DataCount (1 Byte): Anzahl der folgenden Messwerte
+        data_count = min(len(adc_data), 50)  # Max 50 Werte, die in das Paket passen
+        data[42] = data_count
+
+        # Wichtig: Logge die Anzahl der zu sendenden Proben
+        if state_dict["measurement_active"] or runtime > 0:
+            logger.debug(f"Sende {data_count} ADC-Proben an Delphi (benötigt für {defined_time}s: {int(defined_time * delphi_samples_per_sec)})")
+
+        # 14. Dummy1 (1 Byte): Nicht verwendet
+        data[43] = 0
+
+        # 15. StartMeasureIndex (4 Bytes): Index am Beginn der Messung
+        # KRITISCH: Diese Variable muss richtig gesetzt werden, damit Delphi die Zeit korrekt berechnet
+        # Wir setzen sie auf einen Wert, der der simulierten Frequenz entspricht
+        # Delphi berechnet die Zeit basierend auf StartMeasureIndex und MessRate
+        # StartMeasureIndex = Punktnummer / MessRate * 100
+
+        # Minimum an Samples, die wir für die volle Zeit benötigen
+        min_samples_needed = int(defined_time * delphi_samples_per_sec)
+
+        # Anzahl der tatsächlich gesammelten Samples
+        samples_collected = len(adc_data)
+
+        # Stelle sicher, dass der start_index mindestens die volle Messzeit abdeckt
+        if samples_collected < min_samples_needed:
+            # Wir haben nicht genug Samples - setze start_index so, dass wir die volle Zeit haben
+            start_index = int(min_samples_needed / delphi_samples_per_sec * 100)
+            logger.info(f"Anpassung des start_index auf {start_index} um volle Messzeit zu garantieren")
+        else:
+            # Normale Berechnung - aber stelle sicher, dass wir mindestens die definierte Zeit haben
+            # Verwende die definierte Zeit als Basis für den Index
+            start_index = int(defined_time * 100)  # 100% der definierten Zeit
+            logger.debug(f"Start_index basierend auf definierter Zeit: {start_index}")
+
+        struct.pack_into('<i', data, 44, start_index)
+
+        # 16. MinorVersion, MajorVersion (1 Byte jeweils)
+        data[48] = Config.FIRMWARE_VERSION_MINOR
+        data[49] = Config.FIRMWARE_VERSION_MAJOR
+
+        # 17. MoveNext (1 Byte): Bewegungsrichtung
+        data[50] = 0
+
+        # 18. MoveWait (2 Bytes): Wartezeit
+        struct.pack_into('<H', data, 51, 0)
+
+        # 19. Q528_State (1 Byte): Status der Zustandsmaschine
+        data[53] = state_dict["q628_state"].value
+
+        # 20. NotUsed2 (1 Byte): Nicht verwendet
+        data[54] = 0
+
+        # Ensure padding to 56 bytes
+        data[55] = 0
+
+        # Datenarray (wichtig: beginnt bei Byte 56)
+        # Das Delphi-Format erwartet Array[0..49] of Longint ab Offset 56
+        for i in range(50):
+            value = 0
+            if i < data_count:
+                value = adc_data[i]
+
+            # Wert in das Array packen (4 Bytes pro int)
+            struct.pack_into('<i', data, 56 + i * 4, value)
+
+        # Debugausgabe für Datenübertragung
+        if runtime > 0 and state_dict["measurement_active"]:
+            # Details während aktiver Messung loggen
+            logger.info(f"⏱️ Sending runtime={runtime}s, HV={state_dict['hv_status']}, " +
+                        f"T={state_dict['temperature']:.1f}°C, H={state_dict['humidity']:.1f}%, " +
+                        f"Field={state_dict['field_strength']:.2f}kV/m")
+
+        return bytes(data)
+
+    except Exception as e:
+        logger.error("❌ Error creating TTCP_DATA: %s", e, exc_info=True)
+        return struct.pack('<I', 256) + bytes(252)
+    
+
+def free_port(port: int) -> None:
+    """
+    Kill any process that is using the specified port
+
+    Args:
+        port: TCP port number to free
+    """
+    try:
+        output = subprocess.check_output(f"lsof -t -i:{port}", shell=True).decode()
+        for pid in output.strip().split('\n'):
+            if pid:  # Check if pid is not empty
+                os.system(f"kill -9 {pid}")
+        logger.info("🔪 Terminated previous processes on port %d", port)
+    except subprocess.CalledProcessError:
+        # This is expected if no process is using the port
+        logger.info("✅ Port %d is free", port)
+    except Exception as e:
+        logger.warning("⚠️ Error freeing port %d: %s", port, e)
+
+
+def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
+    """
+    Handle client connection with proper command processing and robust error handling.
+
+    Args:
+        conn: Connected socket object
+        addr: Client address tuple (ip, port)
+    """
+    client_id = f"{addr[0]}:{addr[1]}"
+    logger.info("🔌 Connected to %s", client_id)
+    system_state.increment_clients()
+    system_state.set("last_ip", addr[0])
+
+    # Set TCP_NODELAY for this connection (critical for Delphi)
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception as e:
+        logger.warning("⚠️ Could not set TCP_NODELAY for %s: %s", client_id, e)
+
+    # Set a reasonable timeout
+    conn.settimeout(0.05)
+
+    # Track consecutive errors
+    error_count = 0
+    MAX_ERRORS = 5
+
+    # Send immediate response on connection (required by Delphi)
+    response = build_ttcp_data()
+    try:
+        conn.sendall(response)
+        logger.info("📤 Sent initial data packet to %s (%d bytes)", client_id, len(response))
+    except Exception as e:
+        logger.error("❌ Error sending initial packet to %s: %s", client_id, e)
+        conn.close()
+        system_state.decrement_clients()
+        return
+
+    try:
+        while not shutdown_requested.is_set():
+            # Receive command with timeout
+            try:
+                cmd_data = conn.recv(Config.BUFFER_SIZE)
+                if not cmd_data:
+                    logger.info("👋 Client %s disconnected", client_id)
+                    break
+
+                # Reset error count on successful receive
+                error_count = 0
+
+            except socket.timeout:
+                # Just continue the loop on timeout
+                continue
+            except ConnectionResetError:
+                logger.warning("🔌 Connection reset by %s", client_id)
+                break
+            except Exception as e:
+                error_count += 1
+                logger.error("❌ Error receiving data from %s: %s (error #%d)",
+                             client_id, e, error_count)
+
+                if error_count >= MAX_ERRORS:
+                    logger.error("⛔ Too many consecutive errors, closing connection to %s", client_id)
+                    break
+
+                # Short pause before retry
+                time.sleep(0.5)
+                continue
+
+            # Log received command
+            logger.info("Received from %s (%d bytes): %s",
+                        client_id, len(cmd_data), cmd_data.hex())
+
+            # Parse the command if it looks like a valid TTCP_CMD
+            cmd_info = parse_ttcp_cmd(cmd_data) if len(cmd_data) >= 16 else None
+
+            if cmd_info:
+                logger.info(
+                    f"✅ Executed command: {cmd_info['cmd']} - State after execution: {system_state.get_q628_state().name}")
+                # Process command based on type
+                # Inside parse_ttcp_cmd function:
+                if cmd_info['cmd_type'] == CommandType.START:
+                    logger.info(f"⚙️ Received configuration: Measurement time={cmd_info['runtime']}s, HVAC={cmd_info['hvac']}V, HVDC={cmd_info['hvdc']}V")
+                    system_state.set("defined_measurement_time", cmd_info['runtime'])
+                    # Set enable_from_pc flag for manual start mode
+                    enable_from_pc.set()
+
+                elif cmd_info['cmd_type'] == CommandType.TRIGGER:  # Simulate button press
+                    logger.info("Received TRIGGER command (simulate button press)")
+                    simulate_start.set()
+
+                elif cmd_info['cmd_type'] == CommandType.GET_STATUS:  # Get status (polling)
+                    logger.info("Received GET STATUS command")
+                    # Just send current status (handled below)
+
+                elif cmd_info['cmd_type'] == CommandType.MOTOR_UP:  # Move motor up
+                    logger.info("Received MOTOR UP command")
+                    move_motor(MotorPosition.UP)
+
+                elif cmd_info['cmd_type'] == CommandType.MOTOR_DOWN:  # Move motor down
+                    logger.info("Received MOTOR DOWN command")
+                    move_motor(MotorPosition.DOWN)
+
+                elif cmd_info['cmd_type'] == CommandType.RESET:  # Reset: disable HV, home motor
+                    logger.info("Received RESET command")
+                    # Clear state and reinitialize
+                    system_state.end_measurement()
+                    stop_sampling()
+                    set_high_voltage(False)
+                    set_valve(ValveStatus.CLOSED)
+                    move_motor(MotorPosition.UP)
+
+                else:
+                    logger.warning("Unknown command: %s", cmd_info['cmd'])
+
+            # Always send a response packet with current status
+            # This is critical for Delphi compatibility
+            try:
+                response = build_ttcp_data()
+
+                # Log detailed information about what we're sending
+                state_dict = system_state.get_status_dict()
+                runtime = state_dict["runtime"]
+
+                # Create a summary of what we're sending
+                data_summary = {
+                    "size": 256,
+                    "runtime": runtime,
+                    "temperature": state_dict["temperature"],
+                    "humidity": state_dict["humidity"],
+                    "field_strength": state_dict["field_strength"],
+                    "hv_ac": state_dict["hv_ac_value"],
+                    "hv_dc": state_dict["hv_dc_value"],
+                    "state": state_dict["q628_state"].name,
+                    "measurement_active": state_dict["measurement_active"],
+                    "sampling_active": state_dict["sampling_active"],
+                    "datapoints": len(state_dict["adc_data"])
+                }
+
+                logger.debug(f"📤 TCP Response to Delphi: {data_summary}")
+
+                conn.sendall(response)
+                logger.debug("📤 Sent response to %s (%d bytes)", client_id, len(response))
+
+                # Reset error count on successful send
+                error_count = 0
+
+            except socket.timeout:
+                error_count += 1
+                logger.warning("⏱️ Timeout sending response to %s (error #%d)",
+                               client_id, error_count)
+            except Exception as e:
+                error_count += 1
+                logger.error("❌ Error sending response to %s: %s (error #%d)",
+                             client_id, e, error_count)
+
+                if error_count >= MAX_ERRORS:
+                    logger.error("⛔ Too many consecutive errors, closing connection to %s", client_id)
+                    break
+
+    except Exception as e:
+        logger.error("❌ Unhandled error with client %s: %s", client_id, e, exc_info=True)
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+        system_state.decrement_clients()
+        logger.info("👋 Connection to %s closed", client_id)
+
+
+def ttcp_server(port: int) -> None:
+    """
+    TCP server with proper socket options and error handling
+
+    Args:
+        port: TCP port to listen on
+    """
+    logger.info("Starting TTCP server on port %d...", port)
+
+    server = None
+
+    while not shutdown_requested.is_set():
+        try:
+            # Free the port before binding
+            free_port(port)
+
+            # Create IPv4 socket
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Set TCP_NODELAY for the server socket
+            server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            server.bind(('0.0.0.0', port))
+            server.listen(5)
+
+            logger.info("TTCP server running on port %d", port)
+
+            # Accept connections in a loop
+            while not shutdown_requested.is_set():
+                try:
+                    # Use a timeout to allow checking shutdown_requested
+                    server.settimeout(1.0)
+                    conn, addr = server.accept()
+
+                    # Start a new thread to handle this client
+                    client_thread = threading.Thread(
+                        target=handle_client,
+                        args=(conn, addr),
+                        daemon=True
+                    )
+                    client_thread.start()
+
+                except socket.timeout:
+                    # This is expected due to the timeout we set
+                    continue
+                except Exception as e:
+                    if not shutdown_requested.is_set():
+                        logger.error("Error accepting connection: %s", e)
+                        time.sleep(1)
+
+            # Close the server socket when exiting the loop
+            if server:
+                server.close()
+                server = None
+
+        except Exception as e:
+            logger.error("Critical error in TTCP server: %s", e, exc_info=True)
+
+            # Close the server socket if it exists
+            if server:
+                try:
+                    server.close()
+                except:
+                    pass
+                server = None
+
+            # Wait before retrying
+            logger.info("Waiting 5 seconds before restarting server on port %d...", port)
+            time.sleep(5)
+
+    logger.info("TTCP server on port %d stopped", port)
+
+
+def status_monitor() -> None:
+    """Monitor and log system status periodically"""
+    logger.info("📊 Status monitor started")
+
+    while not shutdown_requested.is_set():
+        try:
+            state_dict = system_state.get_status_dict()
+            motor_status = state_dict["motor_status"]
+            q628_state = state_dict["q628_state"]
+
+            status = (
+                f"Status: HV={'ON' if state_dict['hv_status'] else 'OFF'}, "
+                f"Valve={state_dict['valve_status']}, "
+                f"Motor={state_dict['motor_position']}, "
+                f"Motor Status={motor_status}, "
+                f"Q628 State={q628_state.name}, "
+                f"Cycles={state_dict['cycle_count']}, "
+                f"Clients={state_dict['connected_clients']}, "
+                f"Temp={state_dict['temperature']:.1f}°C, "
+                f"Humid={state_dict['humidity']:.1f}%, "
+                f"Field={state_dict['field_strength']:.2f}kV/cm, "
+                f"Measurement={'ACTIVE' if state_dict['measurement_active'] else 'INACTIVE'}, "
+                f"Sampling={'ACTIVE' if state_dict['sampling_active'] else 'INACTIVE'}, "
+                f"Runtime={state_dict['runtime']}s"
+            )
+            logger.info("📊 %s", status)
+
+            # Check IP address periodically
+            if state_dict["cycle_count"] % 5 == 0:
+                get_current_ip()
+
+        except Exception as e:
+            logger.error("❌ Error in status monitor: %s", e)
+
+        # Sleep for the configured interval, but check shutdown_requested more frequently
+        for _ in range(Config.STATUS_UPDATE_INTERVAL):
+            if shutdown_requested.is_set():
+                break
+            time.sleep(1)
+
+    logger.info("📊 Status monitor terminated")
+
+
+def cleanup() -> None:
+    """Clean up hardware resources"""
+    logger.info("🧹 Performing cleanup...")
+
+    try:
+        # Safety: ensure HV is off
+        set_high_voltage(False)
+
+        # Turn off LED
+        GPIO.output(Config.START_LED_GPIO, GPIO.LOW)
+
+        # Reset all outputs
+        GPIO.output(Config.MAGNET1_GPIO, GPIO.LOW)
+        GPIO.output(Config.MAGNET2_GPIO, GPIO.LOW)
+
+        # Cleanup GPIO
+        GPIO.cleanup()
+        logger.info("✅ Hardware cleanup completed")
+    except Exception as e:
+        logger.error("❌ Error during cleanup: %s", e)
+        
+
+# ===== Main Application =====
+def main() -> None:
+    """Main application entry point"""
+    # Setup logging first
+    setup_logging()
+
+    logger.info("Starting QUMAT628 control system...")
+
+    # Initialize hardware
+    if not initialize_hardware():
+        logger.warning("Hardware initialization failed, continuing anyway...")
+
+    # Get and log IP address
+    get_current_ip()
+
+    # Start main server on primary port
+    main_server_thread = threading.Thread(
+        target=ttcp_server,
+        args=(Config.PRIMARY_PORT,),
+        daemon=True
+    )
+    main_server_thread.start()
+    logger.info("Main TCP server started on port %d", Config.PRIMARY_PORT)
+
+    # Start compatibility server on secondary port
+    compat_server_thread = threading.Thread(
+        target=ttcp_server,
+        args=(Config.COMPAT_PORT,),
+        daemon=True
+    )
+    compat_server_thread.start()
+    logger.info("Compatibility TCP server started on port %d", Config.COMPAT_PORT)
+
+    # Start status monitor
+    status_thread = threading.Thread(target=status_monitor, daemon=True)
+    status_thread.start()
+    logger.info("Status monitor started")
+
+    try:
+        # Main thread just waits for keyboard interrupt
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Program interrupted by user (Ctrl+C)")
+    finally:
+        logger.info("Shutting down...")
+        shutdown_requested.set()
+        time.sleep(2)  # Give threads time to clean up
+        cleanup()
+        logger.info("Program terminated.")
+
+
+if __name__ == "__main__":
+    try:
+        # Simple output at startup
+        print("QUMAT628 Control System starting...")
+        
+        # Setup logging
+        setup_logging()
+        
+        logger.info("QUMAT628 Control System started. Initializing system...")
+        
+        # Initialize hardware
+        if not initialize_hardware():
+            logger.error("Hardware initialization failed. Exiting program.")
+            sys.exit(1)
+        
+        # Launch main function
+        main()
+        
+    except Exception as e:
+        print(f"Critical error at startup: {e}")
+        print(traceback.format_exc())
+        sys.exit(1)
