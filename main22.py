@@ -35,7 +35,7 @@ class Config:
     MASK_ACT  = 0b00010000  # Motor is active
 
     # Reference Voltages
-    VREF_ADC = 2.5       # MCP3553 uses 2.5V reference
+    VREF_ADC = 2.048    # MCP3553 uses 2.5V reference
     VREF_DAC = 4.096
     DAC_GAIN = 1.2
 
@@ -91,14 +91,13 @@ class Config:
     ADC_BUFFER_SIZE = 10000      # Size of ring buffer for ADC samples (increased to handle long measurements)
     ADC_CLK_DELAY = 0.000002     # Clock delay for bit-banged SPI (2μs for ~250kHz)
     DAC_CLK_DELAY = 0.00001      # Clock delay for bit-banged SPI
+    
+    ADC_SAMPLE_RATE = 60.0    # MCP3553 delivers ~60 samples/second (from adc_gui.py)
+    ADC_SAMPLE_INTERVAL = 1.0/ADC_SAMPLE_RATE  # ~16.67ms between samples
+    ADC_CLK_DELAY = 0.000005  # 5μs (matches adc_gui.py)
+    DAC_CLK_DELAY = 0.00001   # 10μs (matches dac_gui.py)
+    FIXED_INITIALIZATION_TIME = 5 # Fixed initialization time for ADC/DAC
 
-    # Profile Delays (in seconds)
-    PROFILE_DELAYS = {
-        0: 0.2, 1: 0.3, 2: 0.6, 3: 1.0, 4: 2.0, 5: 4.0,
-        6: 8.0, 7: 8.0, 8: 12.0, 9: 12.0, 10: 20.0,
-        11: 20.0, 12: 40.0, 13: 40.0
-    }
-    DEFAULT_PROFILE_DELAY = 6.0  # Default profile delay if not found in PROFILE_DELAYS
 
 
 
@@ -503,9 +502,12 @@ class SystemState:
             self._state["adc_data"] = []
 
     def get_profile_delay(self, profile_id: int) -> float:
-        """Get delay time for specified profile"""
-        return Config.PROFILE_DELAYS.get(profile_id, Config.DEFAULT_PROFILE_DELAY)
+        """  VERALTET: Diese Methode wird im neuen Ablauf nicht mehr verwendet,
+        stattdessen wird FIXED_INITIALIZATION_TIME verwendet.
+        Zur Rückwärtskompatibilität wird ein Warnhinweis ausgegeben. """
 
+        logger.warning("⚠️ get_profile_delay() called but profiles are disabled in new process flow")
+        return Config.FIXED_INITIALIZATION_TIME  # Immer feste Zeit zurückgeben
 
 # ===== Ring Buffer for ADC Data =====
 class RingBuffer:
@@ -654,6 +656,17 @@ def initialize_hardware() -> bool:
         GPIO.output(Config.PIN_CS_DAC, GPIO.HIGH)  # Chip select inactive
         GPIO.output(Config.PIN_CLK_DAC, GPIO.LOW)
         GPIO.output(Config.PIN_DAT_DAC, GPIO.LOW)
+        GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
+        time.sleep(0.01)
+        GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
+        time.sleep(0.02)
+        logger.info("✅ ADC initialized with soft reset")
+
+        # Initial state for DAC
+        GPIO.output(Config.PIN_CS_DAC, GPIO.HIGH)  # Chip select inactive
+        GPIO.output(Config.PIN_CLK_DAC, GPIO.LOW)
+        GPIO.output(Config.PIN_DAT_DAC, GPIO.LOW)
+        logger.info("✅ DAC pins initialized")
 
         # Test I2C connection to motor controller
         try:
@@ -760,18 +773,17 @@ def temperature_humidity_monitor() -> None:
 
 
 
-
 def continuous_adc_sampling_thread() -> None:
     """
     Thread for continuous ADC sampling.
-    Samples at approximately 20-30Hz (33-50ms), which is more reliable.
+    Samples at approximately 60Hz (~16.67ms) like the GUI implementation.
     """
     logger.info("📊 Continuous ADC sampling started")
     sample_count = 0
     last_sample_time = time.time()
     
-    # Use a slightly longer interval than requested for more reliable operation
-    ACTUAL_SAMPLE_INTERVAL = 0.033  # ~30Hz is more reliable than 50Hz
+    # Use the same interval as the GUI (60Hz - MCP3553's natural rate)
+    ACTUAL_SAMPLE_INTERVAL = Config.ADC_SAMPLE_INTERVAL  # ~16.67ms
     
     # Perform initial soft reset
     GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
@@ -793,6 +805,16 @@ def continuous_adc_sampling_thread() -> None:
                     system_state.set("field_strength", raw_value)
                     system_state.set("last_adc_value", raw_value)
                     
+                    # Calculate voltage like GUI does
+                    vref = Config.VREF_ADC
+                    voltage = (float(raw_value) / ((1 << 21) - 1)) * vref * 2
+                    
+                    # Store voltage and raw value
+                    with temp_buffer_lock:
+                        temp_buffer["latest_value"] = raw_value
+                        temp_buffer["voltage"] = voltage
+                        temp_buffer["timestamp"] = current_time
+                    
                     # Always add to ADC buffer regardless of measurement state
                     adc_buffer.enqueue(raw_value)
                     system_state.add_adc_data(raw_value)
@@ -800,18 +822,15 @@ def continuous_adc_sampling_thread() -> None:
                     # Update sample count for logging
                     sample_count += 1
                     
-                    # Hex format for logging
-                    hex_str = f"0x{raw_value:06X}"
-                    
                     # Periodic logging
-                    if sample_count % 30 == 0:  # Log approximately every second
-                        logger.info(f"Raw ADC value: {hex_str} ({raw_value})")
+                    if sample_count % 60 == 0:  # Log approximately every second at 60Hz
+                        logger.info(f"Raw ADC value: 0x{raw_value:06X} ({raw_value}) = {voltage:.6f}V")
                 
                 # Update last sample time
                 last_sample_time = current_time
             
             # Short sleep to prevent CPU hogging
-            time.sleep(0.005)
+            time.sleep(0.001)  # Shorter sleep for more precise timing
                 
         except Exception as e:
             logger.error(f"❌ Error in continuous ADC sampling: {e}")
@@ -1012,14 +1031,13 @@ def blink_led(mode: str = "slow", duration: float = 3.0) -> None:
         except:
             pass
 
-
 def led_control_thread() -> None:
     """
     Control LED status indication based on system state.
 
     LED patterns:
-    - Slow blink: System initializing or shutting down
-    - Solid on: Ready to start (after 'S' command)
+    - Slow blink: System initializing or in IDLE
+    - Solid on: Ready to start (after 'S' command, waiting for button)
     - Fast blink: Measurement in progress (after button press)
     """
     logger.info("💡 LED control thread started")
@@ -1041,19 +1059,26 @@ def led_control_thread() -> None:
                 led_state = not led_state
                 GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
                 time.sleep(blink_pattern)
+            elif current_state == Q628State.IDLE:
+                # Slow blinking in IDLE state too
+                blink_pattern = Config.LED_BLINK_SLOW
+                led_state = not led_state
+                GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
+                time.sleep(blink_pattern)
             elif waiting_for_button:
                 # Solid on when waiting for button press
                 GPIO.output(Config.START_LED_GPIO, GPIO.HIGH)
                 led_state = True
                 time.sleep(0.1)
             elif measurement_active:
-                # Fast blinking during measurement
+                # Fast blinking during any active measurement phase
+                # (WAIT_HV, START, PRE_ACTIV, ACTIV)
                 blink_pattern = Config.LED_BLINK_FAST
                 led_state = not led_state
                 GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
                 time.sleep(blink_pattern)
             else:
-                # Slow blinking in all other states
+                # Default pattern for other states: slow blinking
                 blink_pattern = Config.LED_BLINK_SLOW
                 led_state = not led_state
                 GPIO.output(Config.START_LED_GPIO, GPIO.HIGH if led_state else GPIO.LOW)
@@ -1235,21 +1260,25 @@ def move_motor(position: MotorPosition) -> bool:
 
 def set_high_voltage(enabled: bool) -> None:
     """
-    Enable or disable high voltage
-
-    Args:
-        enabled: True to enable, False to disable
+    Enable or disable high voltage (both AC and DC)
     """
     status_text = 'ON' if enabled else 'OFF'
     logger.info("⚡ High voltage: %s", status_text)
 
     try:
         system_state.set("hv_status", enabled)
+        
+        # Hauptsteuerung über HVAC_GPIO
         GPIO.output(Config.HVAC_GPIO, GPIO.HIGH if enabled else GPIO.LOW)
+        
+        # Zusätzlich bei Aktivierung Werte loggen
+        if enabled:
+            hv_ac = system_state.get("hv_ac_value")
+            hv_dc = system_state.get("hv_dc_value")
+            logger.info(f"⚡ Applied voltage values - AC:{hv_ac}V, DC:{hv_dc}V")
     except Exception as e:
         logger.error("❌ Error setting high voltage: %s", e)
         system_state.set("last_error", f"HV error: {str(e)}")
-
 
 def read_temperature_humidity() -> Tuple[float, float]:
     """
@@ -1285,21 +1314,20 @@ def read_temperature_humidity() -> Tuple[float, float]:
         logger.error("❌ Error reading temperature/humidity: %s", e)
         return (23.5, 45.0)  # Return default values on error
 
-
 def read_adc_22bit() -> int:
     """
     Read 22-bit raw value from MCP3553SN ADC via bit-banged SPI.
     Implements soft reset AFTER each sample for more reliable operation.
     
     Returns:
-        Raw integer ADC value with no conversion
+        Raw signed integer ADC value with no conversion
     """
     with adc_lock:
         try:
             # Wait for SDO to go LOW (indicates data ready)
             ready = False
             timeout_start = time.time()
-            timeout_limit = 0.1  # Reduced timeout to 100ms - more responsive
+            timeout_limit = 0.1  # Reduced timeout for more responsive behavior
             
             while time.time() - timeout_start < timeout_limit:
                 if GPIO.input(Config.PIN_SDO_ADC) == GPIO.LOW:
@@ -1316,34 +1344,34 @@ def read_adc_22bit() -> int:
                 return 0
             
             # SDO is LOW - read 24 bits from the ADC (MSB first)
-            raw_value = 0
+            value = 0
             for _ in range(24):
                 GPIO.output(Config.PIN_CLK_ADC, GPIO.HIGH)
-                time.sleep(5e-6)  # Shorter clock pulse (5μs)
+                time.sleep(5e-6)  # 5μs for clock pulse (like in GUI)
                 bit = GPIO.input(Config.PIN_SDO_ADC)
-                raw_value = (raw_value << 1) | bit
+                value = (value << 1) | bit
                 GPIO.output(Config.PIN_CLK_ADC, GPIO.LOW)
-                time.sleep(5e-6)  # Shorter clock pulse (5μs)
+                time.sleep(5e-6)  # 5μs for clock pulse
             
             # Extract overflow flags and actual 22-bit value
-            ovh = (raw_value >> 23) & 0x01
-            ovl = (raw_value >> 22) & 0x01
-            signed_value = raw_value & 0x3FFFFF
+            ovh = (value >> 23) & 0x01
+            ovl = (value >> 22) & 0x01
+            signed_value = value & 0x3FFFFF
             
             # Handle two's complement for negative values
             if signed_value & (1 << 21):
                 signed_value -= (1 << 22)
             
             # CRITICAL: Perform soft reset AFTER each sample, not before
-            # This matches the successful example code pattern
+            # This matches the successful example code pattern from adc_gui.py
             GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
             time.sleep(0.01)
             GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
             
             # Debug info - show raw hex value
             if logger.level <= logging.DEBUG:
-                hex_str = f"0x{raw_value:06X}"
-                binary_str = format(raw_value, '024b')
+                hex_str = f"0x{value:06X}"
+                binary_str = format(value, '024b')
                 logger.debug(f"Raw ADC: {hex_str}, Binary: {binary_str}, Value: {signed_value}, OVL={ovl}, OVH={ovh}")
             
             return signed_value
@@ -1364,10 +1392,9 @@ def read_adc() -> Tuple[float, int]:
     """
     return read_adc_22bit()
 
-
 def set_dac(value: int) -> None:
     """
-    Set DAC value using bit-banged SPI
+    Set DAC value using bit-banged SPI with timing from dac_gui.py
     """
     with dac_lock:
         try:
@@ -1376,16 +1403,17 @@ def set_dac(value: int) -> None:
 
             # Start transmission
             GPIO.output(Config.PIN_CS_DAC, GPIO.LOW)
-            time.sleep(Config.DAC_CLK_DELAY)
+            time.sleep(Config.DAC_CLK_DELAY)  # Use 10μs like in dac_gui.py
 
             # Send 16 bits MSB first
             for i in range(15, -1, -1):
                 bit = (value >> i) & 1
                 GPIO.output(Config.PIN_DAT_DAC, bit)
+                time.sleep(Config.DAC_CLK_DELAY)  # Wait before clock high
                 GPIO.output(Config.PIN_CLK_DAC, GPIO.HIGH)
-                time.sleep(Config.DAC_CLK_DELAY)
+                time.sleep(Config.DAC_CLK_DELAY)  # Hold clock high
                 GPIO.output(Config.PIN_CLK_DAC, GPIO.LOW)
-                time.sleep(Config.DAC_CLK_DELAY)
+                time.sleep(Config.DAC_CLK_DELAY)  # Hold clock low
 
             # End transmission
             GPIO.output(Config.PIN_CS_DAC, GPIO.HIGH)
@@ -1396,12 +1424,18 @@ def set_dac(value: int) -> None:
 
 def set_dac_voltage(voltage: float) -> None:
     """
-    Set DAC output voltage
+    Set DAC output voltage with gain compensation like in dac_gui.py
     """
-    # Calculate DAC value
-    dac_value = int((voltage / Config.VREF_DAC) * 65535)
+    # Apply gain compensation (divide by GAIN like in dac_gui.py)
+    v_dac = voltage / Config.DAC_GAIN
+    
+    # Calculate DAC value using the same method as dac_gui.py
+    dac_value = int((v_dac / Config.VREF_DAC) * 65535)
+    dac_value = max(0, min(65535, dac_value))  # Limit to valid range
+    
+    # Send to DAC
     set_dac(dac_value)
-    logger.debug("DAC set to %.3fV (value: %d)", voltage, dac_value)
+    logger.debug(f"DAC set to {voltage:.3f}V (DAC input: {v_dac:.3f}V, value: {dac_value} (0x{dac_value:04X}))")
 
 def adc_sampling_thread() -> None:
     """
@@ -1542,17 +1576,22 @@ def stop_sampling() -> None:
     
     threading.Thread(target=reset_flag, daemon=True).start()
 
-
-# ===== Q628 State Machine =====
 def q628_state_machine() -> None:
     """
-    Main Q628 state machine thread - implementiert die Zustandsmaschine gemäß
-    dem spezifizierten Flussdiagramm mit präziser Zeitsteuerung
+    Main Q628 state machine - Implements the final version with special timing rules:
+    - HV off exactly 3.0s after motor down (modified from 1.5s)
+    - Valves opened whenever motor moves
+    - 3.5s delay after motor positioning before closing valves (modified from 1.5s)
+    - Reports sample statistics at end of measurement
     """
     logger.info("🔄 Q628 state machine started")
 
     # Initial state
     system_state.set_q628_state(Q628State.POWER_UP)
+    
+    # Track motor movement events
+    motor_down_time = None
+    measurement_samples = 0
     
     # Main state machine loop
     while not shutdown_requested.is_set():
@@ -1573,9 +1612,13 @@ def q628_state_machine() -> None:
                 # Disable HV
                 set_high_voltage(False)
 
-                # Open valve
-                set_valve(ValveStatus.OPEN)
+                # Close valve
+                set_valve(ValveStatus.CLOSED)
 
+                # Before moving motor, ensure valves are open
+                set_valve(ValveStatus.OPEN)
+                logger.info("🔧 Opening valves for motor movement")
+                
                 # Move motor to home position
                 move_motor(MotorPosition.UP)
 
@@ -1585,21 +1628,27 @@ def q628_state_machine() -> None:
             elif current_state == Q628State.PRE_IDLE:
                 # Preparing for idle state
                 if elapsed > 3.0:
-                    # After motor has time to move, close valve
-                    set_valve(ValveStatus.CLOSED)
+                    # 3 seconds have passed, now wait 3.5 more seconds with valves open
+                    if elapsed > 6.5:  # 3.0 + 3.5 seconds
+                        # Only close valves 3.5 seconds after motor movement complete
+                        set_valve(ValveStatus.CLOSED)
+                        logger.info("🔧 Closed valves 3.5 seconds after motor reached position")
 
-                    # Transition to IDLE
-                    system_state.set_q628_state(Q628State.IDLE)
+                        # Transition to IDLE
+                        system_state.set_q628_state(Q628State.IDLE)
 
-                    # Blink LED slowly to indicate ready
-                    threading.Thread(
-                        target=blink_led,
-                        args=("slow", 3.0),
-                        daemon=True
-                    ).start()
+                        # LED blinks slowly in IDLE state
+                        threading.Thread(
+                            target=blink_led,
+                            args=("slow", 3.0),
+                            daemon=True
+                        ).start()
 
             elif current_state == Q628State.IDLE:
                 # System idle, waiting for commands
+                # Reset measurement sample counter
+                measurement_samples = 0
+                
                 # Check if start command received
                 if enable_from_pc.is_set() or simulate_start.is_set():
                     if simulate_start.is_set():
@@ -1610,7 +1659,17 @@ def q628_state_machine() -> None:
                         # Simulate button press - set timestamp
                         system_state.set_button_press_time()
 
-                        # Skip waiting for button, go directly to WAIT_HV
+                        # Turn on High Voltage immediately 
+                        logger.info("⚡ Turning on High Voltage immediately")
+                        set_high_voltage(True)
+                        
+                        # Start measurement and sampling
+                        adc_buffer.clear()
+                        system_state.clear_adc_data()
+                        start_sampling()
+                        system_state.start_measurement()
+
+                        # Skip waiting for button, go directly to fixed initialization phase
                         system_state.set_q628_state(Q628State.WAIT_HV)
                     else:
                         # Manual start (requires button press)
@@ -1634,14 +1693,25 @@ def q628_state_machine() -> None:
                         # Important: Store button press time
                         system_state.set_button_press_time()
                         
-                        # START MEASUREMENT AND SAMPLING HERE
+                        # Turn on High Voltage immediately upon button press
+                        logger.info("⚡ Turning on High Voltage immediately upon button press")
+                        set_high_voltage(True)
+                        
+                        # START MEASUREMENT AND SAMPLING
                         adc_buffer.clear()
                         system_state.clear_adc_data()
                         start_sampling()
                         system_state.start_measurement()
 
-                        # Transition to WAIT_HV
+                        # Transition to fixed initialization waiting phase
                         system_state.set_q628_state(Q628State.WAIT_HV)
+                        
+                        # Fast LED blinking during measurement
+                        threading.Thread(
+                            target=blink_led,
+                            args=("fast", Config.FIXED_INITIALIZATION_TIME),
+                            daemon=True
+                        ).start()
 
                 # Check for timeout (2 minutes)
                 if elapsed > 120.0:
@@ -1652,46 +1722,64 @@ def q628_state_machine() -> None:
                     system_state.set_q628_state(Q628State.IDLE)
 
             elif current_state == Q628State.WAIT_HV:
-                # Enable HV and open valve
-                set_high_voltage(True)
-                set_valve(ValveStatus.OPEN)
+                # Fixed initialization time instead of profile-based time
+                # HV is already on, just waiting for the fixed time
                 
-                # Wait for profile delay according to chosen profile
-                profile_hin = system_state.get("profile_hin")
-                wait_time = system_state.get_profile_delay(profile_hin)
-
-                if elapsed > wait_time:
-                    # Transition to START when delay elapses
+                if elapsed > Config.FIXED_INITIALIZATION_TIME:
+                    logger.info(f"⏱️ Fixed initialization time of {Config.FIXED_INITIALIZATION_TIME}s completed")
+                    
+                    # After fixed time, transition to START state
+                    # (Open valves & move motor down)
                     system_state.set_q628_state(Q628State.START)
 
             elif current_state == Q628State.START:
-                # Start sampling and measurement
-                # WICHTIG: Vor dem Start des Samplings den ADC-Puffer leeren
-                adc_buffer.clear()
-                system_state.clear_adc_data()
-                            
+                # MODIFIED: Always ensure valves are open before moving motor
+                logger.info("🔧 Opening valves and moving motor down")
+                
+                # Open valves (activate both magnets)
+                set_valve(ValveStatus.OPEN)
+
                 # Move motor down
                 move_motor(MotorPosition.DOWN)
+                
+                # Store the exact time when motor down command was issued
+                motor_down_time = time.time()
+                logger.info(f"⏱️ Motor down command sent at {motor_down_time:.3f}")
 
                 # Transition to PRE_ACTIV
                 system_state.set_q628_state(Q628State.PRE_ACTIV)
 
             elif current_state == Q628State.PRE_ACTIV:
-                # Wait for motor movement to complete
+                # Wait for motor movement to complete (bottom position reached)
                 motor_status = system_state.get("motor_status")
                 
+                # Check if motor has finished moving (not busy)
                 if not (motor_status & MotorStatus.BUSY) or elapsed > 5.0:
-                    # Turn OFF High Voltage once motor is in position
-                    set_high_voltage(False)
-
-                    # Transition to ACTIV
-                    system_state.set_q628_state(Q628State.ACTIV)
-
-                    # Log measurement time
-                    measurement_runtime = system_state.get_measurement_runtime()
-                    defined_time = system_state.get("defined_measurement_time")
-                    time_left = max(0, defined_time - measurement_runtime)
-                    logger.info(f"⏱️ Active measurement running for {measurement_runtime}s, {time_left}s left")
+                    # MODIFIED: Turn HV off exactly 3.0 seconds after motor reached bottom
+                    if motor_down_time is not None:
+                        time_since_motor_down = time.time() - motor_down_time
+                        
+                        if time_since_motor_down >= 3.0:  # CHANGED from 1.5 to 3.0 seconds
+                            logger.info(f"⚡ Exactly 3.0 seconds after motor down - turning OFF High Voltage")
+                            set_high_voltage(False)
+                            
+                            # Transition to ACTIV state
+                            system_state.set_q628_state(Q628State.ACTIV)
+                            logger.info("📊 Active measurement phase started")
+                        else:
+                            # Not yet 3.0 seconds - calculate remaining wait time
+                            remaining = 3.0 - time_since_motor_down
+                            logger.debug(f"⏱️ Waiting {remaining:.3f}s more before turning off HV")
+                            # Stay in this state until exactly 3.0s has passed
+                    else:
+                        logger.warning("⚠️ Motor down time not recorded, using elapsed time")
+                        if elapsed > 3.0:  # CHANGED from 1.5 to 3.0 seconds
+                            logger.info("⚡ Turning OFF High Voltage (using elapsed time fallback)")
+                            set_high_voltage(False)
+                            
+                            # Transition to ACTIV
+                            system_state.set_q628_state(Q628State.ACTIV)
+                            logger.info("📊 Active measurement phase started")
 
             elif current_state == Q628State.ACTIV:
                 # Get precise timing information
@@ -1701,8 +1789,15 @@ def q628_state_machine() -> None:
                 if button_press_time is not None:
                     elapsed_since_start = time.time() - button_press_time
                     
+                    # Update sample count during measurement
+                    current_samples = len(adc_buffer.get_all())
+                    if current_samples > measurement_samples:
+                        # Only log when count increases by 100+ samples
+                        if current_samples - measurement_samples >= 100:
+                            logger.debug(f"📊 Collected {current_samples} samples so far in this measurement")
+                            measurement_samples = current_samples
+                    
                     # CRITICAL: Enforce exact measurement time down to milliseconds
-                    # No margin added - stop exactly at defined time
                     if elapsed_since_start >= defined_time:
                         logger.info(f"⏱️ Exact measurement time reached: {elapsed_since_start:.3f}s / {defined_time}s")
                         
@@ -1729,51 +1824,81 @@ def q628_state_machine() -> None:
                 time.sleep(0.001)
 
             elif current_state == Q628State.FINISH:
-                # Sicherstellen, dass das Sampling gestoppt ist
+                # Ensure sampling is stopped
                 if sampling_active.is_set() or system_state.is_sampling_active():
                     stop_sampling()
-                    logger.info("Ensuring sampling is stopped")
+                    logger.info("📊 Ensuring sampling is stopped")
                 
-                # Motor hochfahren
+                # MODIFIED: Open valves before motor movement
+                logger.info("🔧 Opening valves for motor movement")
+                set_valve(ValveStatus.OPEN)
+                
+                # Move motor up
+                logger.info("🔧 Moving motor back up to home position")
                 move_motor(MotorPosition.UP)
-                time.sleep(3)
-
-                # Warten bis Motor oben ist
+                
+                # Wait for motor to reach home position
                 wait_for_motor_home(timeout=10)
-
-                # Ventil schließen
+                
+                # MODIFIED: Wait exactly 3.5 seconds after motor reached position
+                logger.info("⏱️ Waiting exactly 3.5 seconds after motor reached home position")
+                time.sleep(3.5)  # CHANGED from 1.5 to 3.5 seconds
+                
+                # Close valves (deactivate magnets)
+                logger.info("🔧 Closing valves 3.5s after motor reached home")
                 set_valve(ValveStatus.CLOSED)
 
-                # Messung beenden
+                # Report sample statistics at end of measurement
+                total_samples = len(adc_buffer.get_all()) 
+                defined_time = system_state.get("defined_measurement_time")
+                expected_samples = int(defined_time * Config.SIMULATED_SAMPLE_RATE)
+                
+                # Provide comprehensive measurement summary at the end
+                logger.info("=" * 80)
+                logger.info(f"📊 MEASUREMENT COMPLETE - Sample Statistics:")
+                logger.info(f"📊 Total samples collected: {total_samples}")
+                logger.info(f"📊 Expected samples: {expected_samples}")
+                logger.info(f"📊 Samples sent to client: {last_sent_index}")
+                logger.info(f"📊 Measurement duration: {defined_time}s")
+                logger.info(f"📊 Effective sample rate: {total_samples/defined_time:.2f} samples/second")
+                
+                if total_samples < expected_samples:
+                    logger.warning(f"⚠️ Collected fewer samples than expected ({total_samples} vs {expected_samples})")
+                elif total_samples > expected_samples:
+                    logger.warning(f"⚠️ Collected more samples than expected ({total_samples} vs {expected_samples})")
+                else:
+                    logger.info(f"✅ Collected exactly the expected number of samples: {total_samples}")
+                logger.info("=" * 80)
+
+                # End measurement
                 system_state.end_measurement()
 
-                # Zurück zu IDLE
+                # Return to IDLE
                 system_state.set_q628_state(Q628State.IDLE)
 
-            # Kurze Schlafzeit um CPU-Last zu reduzieren
-            # Kurze Schlafzeit für ACTIV, längere für andere Zustände
+            # Sleep time to reduce CPU load
+            # Short for ACTIV, longer for other states
             if current_state == Q628State.ACTIV:
-                time.sleep(0.001)  # Sehr reaktionsschnell während aktiver Messung
+                time.sleep(0.001)  # Very responsive during active measurement
             else:
-                time.sleep(0.1)    # Weniger reaktionsschnell für andere Zustände
+                time.sleep(0.1)    # Less responsive for other states
 
         except Exception as e:
             logger.error("❌ Error in Q628 state machine: %s", e, exc_info=True)
 
-            # Sicherheitsmaßnahmen im Fehlerfall
+            # Safety measures in case of error
             try:
                 set_high_voltage(False)
                 set_valve(ValveStatus.CLOSED)
                 stop_sampling()
                 system_state.end_measurement()
 
-                # Nach Fehler zu IDLE zurückkehren
+                # Return to IDLE after error
                 system_state.set_q628_state(Q628State.IDLE)
             except Exception as cleanup_error:
                 logger.error("Error during emergency cleanup: %s", cleanup_error)
 
-            time.sleep(1.0)  # Bei Fehler länger schlafen
-
+            time.sleep(1.0)  # Longer sleep after error
 
 def wait_for_motor_home(timeout: float = 10.0) -> bool:
     """
@@ -1812,12 +1937,8 @@ def wait_for_motor_home(timeout: float = 10.0) -> bool:
 
 def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
     """
-    Parse Delphi-compatible TTCP_CMD packet
-
-    Args:
-        data: Raw bytes from TCP connection
-
-    Returns:        Dictionary with parsed command or None if invalid
+    Parse Delphi-compatible TTCP_CMD packet - ignoring profile settings
+    as per the new process flow spec
     """
     try:
         if len(data) < 32:  # Delphi sends 8 x 4-byte ints = 32 bytes
@@ -1831,16 +1952,22 @@ def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
         cmd_char = chr(cmd_int) if 32 <= cmd_int <= 126 else '?'
         cmd_type = next((c for c in CommandType if c.value == cmd_char), CommandType.UNKNOWN)
 
-        logger.info("Parsed TTCP_CMD: %s (runtime=%ds, HVAC=%d, HVDC=%d, profiles=%d/%d)",
-                    cmd_char, runtime, hvac, hvdc, profile1, profile2)
+        # GEÄNDERT: Logge, dass Profile ignoriert werden
+        if profile1 != 0 or profile2 != 0 or wait_acdc != 0:
+            logger.info("⚠️ Profile settings received but will be IGNORED (profile1=%d, profile2=%d, wait_acdc=%d)",
+                    profile1, profile2, wait_acdc)
+
+        logger.info("Parsed TTCP_CMD: %s (runtime=%ds, HVAC=%d, HVDC=%d)",
+                    cmd_char, runtime, hvac, hvdc)
 
         # Update system state with received parameters
+        # Die Profile werden zwar gespeichert, aber in der State-Machine nicht verwendet
         system_state.update(
-            profile_hin=profile1,
-            profile_zurueck=profile2,
-            wait_acdc=wait_acdc,
-            hv_ac_value=hvac,
-            hv_dc_value=hvdc
+            profile_hin=profile1,            # Wird gespeichert, aber ignoriert
+            profile_zurueck=profile2,        # Wird gespeichert, aber ignoriert
+            wait_acdc=wait_acdc,             # Wird gespeichert, aber ignoriert
+            hv_ac_value=hvac,                # Wird für AC-Spannung verwendet
+            hv_dc_value=hvdc                 # Wird für DC-Spannung verwendet
         )
 
         # When receiving START command, set the defined measurement time
@@ -1855,13 +1982,15 @@ def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
             'runtime': runtime,
             'hvac': hvac,
             'hvdc': hvdc,
-            'profile1': profile1,
-            'profile2': profile2,
-            'wait_acdc': wait_acdc
+            'profile1': profile1,    # Wird zurückgegeben, aber ignoriert
+            'profile2': profile2,    # Wird zurückgegeben, aber ignoriert
+            'wait_acdc': wait_acdc   # Wird zurückgegeben, aber ignoriert
         }
     except Exception as e:
         logger.error("Error parsing TTCP_CMD: %s", e)
         return None
+
+
 
 def build_ttcp_data() -> bytes:
     """
@@ -2029,16 +2158,14 @@ def build_ttcp_data() -> bytes:
                 last_sent_index = expected_total
                 logger.warning(f"Capped last_sent_index to expected_total ({expected_total})")
             
-            # Debug output - show some sample values with both 22-bit and 32-bit representations
-            sample_debug = []
-            for i in range(min(3, len(sent_values))):
-                raw_22bit, int32_value = sent_values[i]
-                sample_debug.append(f"0x{raw_22bit:06X}→{int32_value}")
-            
-            logger.info(f"⏱️ Sending {data_count} NEW samples: {', '.join(sample_debug)}... " +
-                      f"(Total sent so far: {last_sent_index}/{expected_total})")
+            # Only log at completion or major milestones, not for every packet
+            if last_sent_index == expected_total:
+                logger.info(f"📊 Completed sending all {expected_total} samples to Delphi client")
+            elif last_sent_index % 1000 == 0:  # Only log every 1000 samples
+                logger.info(f"📊 Progress: {last_sent_index}/{expected_total} samples sent ({(last_sent_index/expected_total*100):.1f}%)")
         else:
-            logger.info("No new samples to send in this packet")
+            # Don't log anything when no samples are sent
+            pass
 
         # If measurement is complete, reset the tracker
         if (not state_dict["measurement_active"] and runtime >= defined_time) or last_sent_index >= expected_total:
@@ -2050,26 +2177,6 @@ def build_ttcp_data() -> bytes:
     except Exception as e:
         logger.error(f"❌ Error creating TTCP_DATA: {e}", exc_info=True)
         return struct.pack('<I', 256) + bytes(252)
-
-def free_port(port: int) -> None:
-    """
-    Kill any process that is using the specified port
-
-    Args:
-        port: TCP port number to free
-    """
-    try:
-        output = subprocess.check_output(f"lsof -t -i:{port}", shell=True).decode()
-        for pid in output.strip().split('\n'):
-            if pid:  # Check if pid is not empty
-                os.system(f"kill -9 {pid}")
-        logger.info("🔪 Terminated previous processes on port %d", port)
-    except subprocess.CalledProcessError:
-        # This is expected if no process is using the port
-        logger.info("✅ Port %d is free", port)
-    except Exception as e:
-        logger.warning("⚠️ Error freeing port %d: %s", port, e)
-
 
 def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
     """
@@ -2240,6 +2347,25 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
         system_state.decrement_clients()
         logger.info("👋 Connection to %s closed", client_id)
 
+
+def free_port(port: int) -> None:
+    """
+    Kill any process that is using the specified port
+
+    Args:
+        port: TCP port number to free
+    """
+    try:
+        output = subprocess.check_output(f"lsof -t -i:{port}", shell=True).decode()
+        for pid in output.strip().split('\n'):
+            if pid:  # Check if pid is not empty
+                os.system(f"kill -9 {pid}")
+        logger.info("🔪 Terminated previous processes on port %d", port)
+    except subprocess.CalledProcessError:
+        # This is expected if no process is using the port
+        logger.info("✅ Port %d is free", port)
+    except Exception as e:
+        logger.warning("⚠️ Error freeing port %d: %s", port, e)
 
 def ttcp_server(port: int) -> None:
     """
