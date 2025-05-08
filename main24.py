@@ -11,7 +11,7 @@ import logging
 import smbus2
 import RPi.GPIO as GPIO
 import subprocess
-import select  # Add this to the imports at the top of the file
+import select
 import os
 from enum import Enum, Flag, auto
 from typing import Dict, Any, Optional, Tuple, Union, List
@@ -69,15 +69,14 @@ class Config:
     STATUS_UPDATE_INTERVAL = 30  # Status monitor update interval
     MOTOR_STATUS_POLL_INTERVAL = 0.5  # How often to poll motor status
     
-    # ADC Timing Constants for MCP3553SN
-    ADC_SAMPLE_RATE = 60.0    # MCP3553 delivers ~60 samples/second
-    ADC_SAMPLE_INTERVAL = 1.0/ADC_SAMPLE_RATE  # ~16.67ms between samples
+    # ADC Timing Constants 
+    ADC_TARGET_RATE = 50.0       # Target sample rate: 50Hz
+    ADC_SAMPLE_INTERVAL = 1.0/ADC_TARGET_RATE  # 20ms between samples
     
-    # ===== NEW: Virtual Sampling Grid for Delphi Compatibility =====
+    # Virtual Sampling Grid for Delphi Compatibility
     VIRTUAL_SAMPLE_RATE = 100.0  # Virtual 100Hz sample rate expected by Delphi
     VIRTUAL_SAMPLE_INTERVAL = 1.0/VIRTUAL_SAMPLE_RATE  # 10ms between virtual samples
     SAMPLES_PER_SECOND = 100     # Delphi expects 100 samples per second exactly
-    TOTAL_EXPECTED_SAMPLES = 6000  # For 60s at 100Hz
     
     HYT_SAMPLE_INTERVAL = 1.0    # How often to measure temperature and humidity
     TEMP_HUMID_SAMPLE_INTERVAL = 1.0  # Interval for temperature and humidity measurement
@@ -87,7 +86,7 @@ class Config:
     
     # CSV Data Logging
     CSV_ENABLED = True
-    CSV_BASE_FILENAME = "delphi_data"
+    CSV_FILENAME = "delphi_data.csv"  # Single CSV file for all measurements
 
     # Device Information
     SERIAL_NUMBER = 6280004
@@ -95,19 +94,17 @@ class Config:
     FIRMWARE_VERSION_MINOR = 2
 
     # ADC/DAC Configuration
-    ADC_BUFFER_SIZE = 10000      # Size of ring buffer for ADC samples (increased to handle long measurements)
-    VIRTUAL_BUFFER_SIZE = 6500   # Size of buffer for interpolated 100Hz virtual samples
+    ADC_BUFFER_SIZE = 10000      # Size of ring buffer for ADC samples
+    VIRTUAL_BUFFER_SIZE = 12000  # Size of buffer for 100Hz virtual samples - increased for longer measurements
     ADC_CLK_DELAY = 0.000002     # Clock delay for bit-banged SPI (2μs for ~250kHz)
     DAC_CLK_DELAY = 0.00001      # Clock delay for bit-banged SPI
-    
-    ADC_SAMPLE_RATE = 60.0       # MCP3553 delivers ~60 samples/second (from adc_gui.py)
-    ADC_SAMPLE_INTERVAL = 1.0/ADC_SAMPLE_RATE  # ~16.67ms between samples
-    ADC_CLK_DELAY = 0.000005     # 5μs (matches adc_gui.py)
-    DAC_CLK_DELAY = 0.00001      # 10μs (matches dac_gui.py)
     FIXED_INITIALIZATION_TIME = 2 # Fixed initialization time for ADC/DAC
     
     # HV Control timing
     HV_OFF_DELAY_AFTER_DOWN = 4.0  # Delay in seconds before turning HV off after motor down
+    
+    # Scale factor for better visualization in Delphi
+    SCALE_FACTOR = 16            # 9-bit shift equivalent
 
 
 # ===== Enumerations for State Management =====
@@ -212,6 +209,63 @@ class Q628State(Enum):
     FINISH = auto()        # Finishing measurement
 
 
+# ===== Ring Buffer for ADC Data =====
+class RingBuffer:
+    """Circular buffer for samples with dynamic growth option"""
+
+    def __init__(self, size: int):
+        self.buffer = deque(maxlen=size)
+        self.lock = threading.Lock()
+        self.initial_size = size
+        self.growth_factor = 1.5  # How much to grow when needed
+
+    def get_all(self) -> List[Any]:
+        """Get all values as list without removing them"""
+        with self.lock:
+            return list(self.buffer)
+
+    def enqueue(self, value: Any) -> None:
+        """Add value to buffer, growing if needed"""
+        with self.lock:
+            # Check if buffer is getting full
+            if len(self.buffer) >= self.buffer.maxlen * 0.9:
+                # Grow the buffer
+                new_size = int(self.buffer.maxlen * self.growth_factor)
+                new_buffer = deque(self.buffer, maxlen=new_size)
+                self.buffer = new_buffer
+                logger.warning(f"RingBuffer expanded from {self.buffer.maxlen} to {new_size}")
+            
+            self.buffer.append(value)
+
+    def dequeue(self) -> Optional[Any]:
+        """Remove and return oldest value"""
+        with self.lock:
+            return None if self.is_empty() else self.buffer.popleft()
+
+    def is_empty(self) -> bool:
+        """Check if buffer is empty"""
+        with self.lock:
+            return len(self.buffer) == 0
+
+    def is_full(self) -> bool:
+        """Check if buffer is full"""
+        with self.lock:
+            return len(self.buffer) == self.buffer.maxlen
+
+    def clear(self) -> None:
+        """Clear all values and reset size"""
+        with self.lock:
+            self.buffer.clear()
+            # Reset to initial size when cleared
+            if self.buffer.maxlen != self.initial_size:
+                self.buffer = deque(maxlen=self.initial_size)
+
+    def __len__(self) -> int:
+        """Get current buffer size"""
+        with self.lock:
+            return len(self.buffer)
+
+
 # ===== Global State and Synchronization =====
 class SystemState:
     """Thread-safe system state container"""
@@ -227,33 +281,33 @@ class SystemState:
             "last_ip": "0.0.0.0",
             "connected_clients": 0,
             "measurement_active": False,
-            "sampling_active": False,  # New flag for sampling status
+            "sampling_active": False,
             "start_time": time.time(),
             "measurement_start_time": None,
             "button_press_time": None,
             "defined_measurement_time": 60,  # Default measurement time in seconds
-            "total_expected_samples": Config.TOTAL_EXPECTED_SAMPLES,  # 6000 for 60s at 100Hz
+            "total_expected_samples": 6000,  # 6000 for 60s at 100Hz
             "q628_state": Q628State.POWER_UP,
             "q628_timer": time.time(),
-            "profile_hin": 4,         # Default profile for movement
-            "profile_zurueck": 4,     # Default profile for return
-            "wait_acdc": 11,          # Default wait time for AC/DC
-            "temperature": 23.5,      # Default temperature in °C
-            "humidity": 45.0,         # Default humidity in %
-            "field_strength": 0.0,    # Field strength
-            "hv_ac_value": 230,       # Default HV AC value
-            "hv_dc_value": 6500,      # Default HV DC value
-            "adc_data": [],           # ADC measurement data
-            "last_adc_value": 0,      # Last ADC value read
-            "runtime": 0              # Measurement runtime
+            "profile_hin": 4,
+            "profile_zurueck": 4,
+            "wait_acdc": 11,
+            "temperature": 23.5,
+            "humidity": 45.0,
+            "field_strength": 0.0,
+            "hv_ac_value": 230,
+            "hv_dc_value": 6500,
+            "adc_data": [],
+            "last_adc_value": 0,
+            "runtime": 0,
+            "prev_q628_state": None,  # For tracking state transitions
+            "virtual_sample_count": 0  # Count of samples in 100Hz grid
         }
         self._lock = threading.RLock()
-        self._runtime_timer = None  # Timer for updating runtime
+        self._runtime_timer = None
 
     def get_measurement_runtime(self) -> int:
-        """
-        Calculate elapsed time since measurement start (button press)
-        """
+        """Calculate elapsed time since measurement start (button press)"""
         with self._lock:
             if not self._state["measurement_active"] or self._state["button_press_time"] is None:
                 return 0
@@ -262,38 +316,34 @@ class SystemState:
     def is_measurement_time_elapsed(self) -> bool:
         """
         Check if the defined measurement time has elapsed or exact sample count reached.
-        Compares against the dynamically set measurement time from Delphi.
         """
         with self._lock:
             if not self._state["measurement_active"] or self._state["button_press_time"] is None:
                 return False
                 
-            # Check if time has elapsed
+            # Check if we've reached the exact sample count
+            expected_samples = int(self._state["defined_measurement_time"] * Config.VIRTUAL_SAMPLE_RATE)
+            current_samples = self._state["virtual_sample_count"]
+            
+            if current_samples >= expected_samples:
+                logger.info(f"⏱️ Exact sample count reached: {current_samples}/{expected_samples}")
+                return True
+                
+            # Also check time as a fallback
             elapsed = time.time() - self._state["button_press_time"]
             defined_time = self._state["defined_measurement_time"]
-            time_elapsed = elapsed >= defined_time
-            
-            # Check if exact sample count reached
-            expected_samples = int(defined_time * Config.VIRTUAL_SAMPLE_RATE)
-            current_samples = len(virtual_buffer.get_all())
-            samples_complete = current_samples >= expected_samples
-            
-            # Log if either condition is met
-            if time_elapsed and not samples_complete:
-                logger.info(f"⏱️ Measurement time elapsed ({elapsed:.2f}s/{defined_time}s) but only have {current_samples}/{expected_samples} samples")
-            elif samples_complete and not time_elapsed:
-                logger.info(f"⏱️ Exact sample count reached ({current_samples}/{expected_samples}) at {elapsed:.2f}s/{defined_time}s")
-            
-            # Return true if either condition is met
-            return time_elapsed or samples_complete
+            if elapsed >= defined_time:
+                logger.info(f"⏱️ Measurement time elapsed: {elapsed:.2f}s/{defined_time}s")
+                return True
+                
+            return False
 
     def update(self, **kwargs) -> None:
-        """Thread-safe update of multiple state attributes with runtime limit enforcement"""
+        """Thread-safe update of multiple state attributes"""
         with self._lock:
             self._state.update(kwargs)
             
-            # CRITICAL: Add runtime cap enforcer
-            # If we have an active measurement, ensure runtime never exceeds defined time
+            # Cap runtime at defined time if active measurement
             if (self._state["measurement_active"] and 
                 self._state["button_press_time"] is not None and 
                 "runtime" in self._state):
@@ -301,7 +351,6 @@ class SystemState:
                 defined_time = self._state["defined_measurement_time"]
                 if self._state["runtime"] > defined_time:
                     self._state["runtime"] = defined_time
-                    logger.debug(f"⚠️ Runtime capped at {defined_time}s by setter")
 
     def get(self, key: str) -> Any:
         """Thread-safe state access"""
@@ -324,9 +373,7 @@ class SystemState:
             return self._state["sampling_active"]
 
     def set_button_press_time(self) -> None:
-        """
-        Set button press time to current time
-        """
+        """Set button press time to current time"""
         with self._lock:
             self._state["button_press_time"] = time.time()
             logger.info(f"🕒 Button press time set to: {self._state['button_press_time']}")
@@ -335,6 +382,7 @@ class SystemState:
         """Enable sampling flag"""
         with self._lock:
             self._state["sampling_active"] = True
+            self._state["virtual_sample_count"] = 0  # Reset virtual sample count
             logger.info("📊 Sampling activated")
 
     def stop_sampling(self) -> None:
@@ -343,7 +391,13 @@ class SystemState:
             self._state["sampling_active"] = False
             logger.info("📊 Sampling deactivated")
 
-    def enforce_sample_count_limit(self) -> bool:
+    def increment_virtual_sample_count(self, count: int = 1) -> int:
+        """Increment virtual sample counter and return new value"""
+        with self._lock:
+            self._state["virtual_sample_count"] += count
+            return self._state["virtual_sample_count"]
+
+    def check_sample_count_limit(self) -> bool:
         """
         Check if we've reached the exact sample count limit for this measurement.
         Returns True if measurement should be stopped.
@@ -355,18 +409,20 @@ class SystemState:
             # Get expected sample count for this measurement duration
             expected_count = self._state["total_expected_samples"]
             
-            # Get current sample count from virtual buffer
-            current_count = len(virtual_buffer.get_all())
+            # Get current sample count
+            current_count = self._state["virtual_sample_count"]
             
             # If we've reached or exceeded the expected count, stop the measurement
             if current_count >= expected_count:
-                logger.info(f"⚠️ Reached exact virtual sample count limit: {current_count}/{expected_count}")
+                logger.info(f"⏱️ Reached exact virtual sample count limit: {current_count}/{expected_count}")
                 return True
                 
+            # CRITICAL: Allow measurement to continue even if time is up, until we reach the target
+            # We only terminate when we hit the exact sample count
             return False
 
     def start_measurement(self) -> bool:
-        """Start measurement with explicit sample rate and count control"""
+        """Start measurement with explicit sample count control"""
         with self._lock:
             if self._state["measurement_active"]:
                 return False
@@ -376,8 +432,9 @@ class SystemState:
             self._state["runtime"] = 0
             defined_time = self._state["defined_measurement_time"]
             
-            # CRITICAL: Calculate the exact number of samples that should be collected at 100Hz
+            # Calculate the exact number of samples that should be collected at 100Hz
             self._state["total_expected_samples"] = int(defined_time * Config.VIRTUAL_SAMPLE_RATE)
+            self._state["virtual_sample_count"] = 0
             
             # Clear buffers at start of measurement
             adc_buffer.clear()
@@ -387,17 +444,17 @@ class SystemState:
             global sent_packet_counter
             sent_packet_counter = 0
             
-            # Create a new CSV file for this measurement
-            if Config.CSV_ENABLED:
-                create_new_csv_file()
-            
             # Start runtime update timer
             self._start_runtime_timer()
             
-            logger.info(f"🕒 Measurement started at: {self._state['measurement_start_time']} " +
-                      f"with target of exactly {self._state['total_expected_samples']} virtual samples " +
-                      f"over {defined_time}s")
+            logger.info(f"🕒 Measurement started with target of exactly {self._state['total_expected_samples']} " +
+                      f"virtual samples over {defined_time}s")
             return True
+
+    def _start_runtime_timer(self) -> None:
+        """Start timer to update runtime field with respect to configured time limit"""
+        if self._runtime_timer is not None:
+            return
 
     def _start_runtime_timer(self) -> None:
         """Start timer to update runtime field with respect to configured time limit"""
@@ -409,27 +466,17 @@ class SystemState:
                 with self._lock:
                     if self._state["button_press_time"] is not None:
                         elapsed = time.time() - self._state["button_press_time"]
-                        # Use the configured measurement time from Delphi
                         defined_time = self._state["defined_measurement_time"]
                         
-                        # Cap runtime at defined time
+                        # Cap runtime display at defined time, but don't terminate measurement
                         self._state["runtime"] = min(int(elapsed), defined_time)
                         
-                        # CRITICAL: Force state transition exactly at defined time
-                        if elapsed >= defined_time and self._state["q628_state"] == Q628State.ACTIV:
-                            logger.info(f"⏱️ Runtime timer detected exact end of measurement ({defined_time}s)")
-                            self._state["q628_state"] = Q628State.FINISH
-                            self._state["q628_timer"] = time.time()
-                            
-                            # Stop sampling
-                            sampling_active.clear()
-                            self._state["sampling_active"] = False
-                        
-                        # CRITICAL: Also force state transition if we've collected the exact number of samples
+                        # ONLY check sample count, not time
                         expected_samples = int(defined_time * Config.VIRTUAL_SAMPLE_RATE)
-                        current_samples = len(virtual_buffer.get_all())
+                        current_samples = self._state["virtual_sample_count"]
                         
-                        if current_samples >= expected_samples and self._state["q628_state"] == Q628State.ACTIV:
+                        if (current_samples >= expected_samples and 
+                            self._state["q628_state"] == Q628State.ACTIV):
                             logger.info(f"⏱️ Runtime timer detected exact virtual sample count reached ({current_samples}/{expected_samples})")
                             self._state["q628_state"] = Q628State.FINISH
                             self._state["q628_timer"] = time.time()
@@ -438,20 +485,35 @@ class SystemState:
                             sampling_active.clear()
                             self._state["sampling_active"] = False
                 
-                # Check more frequently for precise timing
-                time.sleep(0.01)  # Check 100 times per second
+                # Check frequently for precise timing
+                time.sleep(0.01)
+
+    
 
         self._runtime_timer = threading.Thread(target=update_runtime, daemon=True)
         self._runtime_timer.start()
 
     def end_measurement(self) -> None:
-        """End measurement"""
+        """End measurement and finalize CSV logging"""
+        global csv_file_handle
+        
         with self._lock:
+            # Skip if measurement is already inactive
+            if not self._state["measurement_active"]:
+                return
+                
             self._state["measurement_active"] = False
             self._state["measurement_start_time"] = None
             self._state["button_press_time"] = None
             self._state["runtime"] = 0
             logger.info("🕒 Measurement ended")
+            
+            # Ensure CSV file is properly finalized
+            if Config.CSV_ENABLED and 'csv_file_handle' in globals() and csv_file_handle is not None:
+                try:
+                    csv_file_handle.flush()
+                except Exception as e:
+                    logger.error(f"❌ Error flushing CSV file during measurement end: {e}")
 
     def increment_cycle_count(self) -> int:
         """Increment cycle counter and return new value"""
@@ -526,90 +588,27 @@ class SystemState:
             self._state["adc_data"] = []
 
     def get_profile_delay(self, profile_id: int) -> float:
-        """  VERALTET: Diese Methode wird im neuen Ablauf nicht mehr verwendet,
-        stattdessen wird FIXED_INITIALIZATION_TIME verwendet.
-        Zur Rückwärtskompatibilität wird ein Warnhinweis ausgegeben. """
-
+        """This method is deprecated but kept for backwards compatibility"""
         logger.warning("⚠️ get_profile_delay() called but profiles are disabled in new process flow")
-        return Config.FIXED_INITIALIZATION_TIME  # Immer feste Zeit zurückgeben
-
-# ===== Ring Buffer for ADC Data =====
-class RingBuffer:
-    """Circular buffer for ADC samples with dynamic growth option"""
-
-    def __init__(self, size: int):
-        self.buffer = deque(maxlen=size)
-        self.lock = threading.Lock()
-        self.initial_size = size
-        self.growth_factor = 1.5  # How much to grow when needed
-
-    def get_all(self) -> List[int]:
-        """Get all values as list without removing them"""
-        with self.lock:
-            return list(self.buffer)
-
-    def enqueue(self, value: int) -> None:
-        """Add value to buffer, growing if needed"""
-        with self.lock:
-            # Check if buffer is getting full
-            if len(self.buffer) >= self.buffer.maxlen * 0.9:
-                # Grow the buffer
-                new_size = int(self.buffer.maxlen * self.growth_factor)
-                new_buffer = deque(self.buffer, maxlen=new_size)
-                self.buffer = new_buffer
-                logger.warning(f"RingBuffer expanded from {self.buffer.maxlen} to {new_size}")
-            
-            self.buffer.append(value)
-
-    def dequeue(self) -> Optional[int]:
-        """Remove and return oldest value"""
-        with self.lock:
-            return None if self.is_empty() else self.buffer.popleft()
-
-    def is_empty(self) -> bool:
-        """Check if buffer is empty"""
-        with self.lock:
-            return len(self.buffer) == 0
-
-    def is_full(self) -> bool:
-        """Check if buffer is full"""
-        with self.lock:
-            return len(self.buffer) == self.buffer.maxlen
-
-    def clear(self) -> None:
-        """Clear all values and reset size"""
-        with self.lock:
-            self.buffer.clear()
-            # Reset to initial size when cleared
-            if self.buffer.maxlen != self.initial_size:
-                self.buffer = deque(maxlen=self.initial_size)
-
-    def __len__(self) -> int:
-        """Get current buffer size"""
-        with self.lock:
-            return len(self.buffer)
+        return Config.FIXED_INITIALIZATION_TIME
 
 
 # ===== Global Variables =====
 system_state = SystemState()
 measurement_start_time = 0
 i2c_bus = None  # Will be initialized in hardware setup
-adc_buffer = RingBuffer(Config.ADC_BUFFER_SIZE)  # Larger buffer for raw ADC samples
-virtual_buffer = RingBuffer(Config.VIRTUAL_BUFFER_SIZE)  # Buffer for 100Hz virtual samples
-temp_buffer_lock = threading.Lock()  # Lock for temp_buffer access
-temp_buffer = {"latest_value": 0, "timestamp": 0.0}  # Temporary buffer for latest ADC value
+adc_buffer = RingBuffer(Config.ADC_BUFFER_SIZE)  # For raw ADC samples
+virtual_buffer = RingBuffer(Config.VIRTUAL_BUFFER_SIZE)  # For 100Hz virtual samples
 
-# For interpolation
-sample_lock = threading.Lock()
-last_two_samples = []  # For storing the last two real ADC samples with timestamps
+# Scale factor for better visualization
+SCALE_FACTOR = Config.SCALE_FACTOR
 
-# 9-bit shift equivalent for improved visualization
-SCALE_FACTOR = 16
-
-# Add this to your global variables or system_state initialization
+# Tracking variables
 last_sent_index = 0  # Global tracker for last sent buffer position
 sent_packet_counter = 0  # Counter for packets sent to Delphi
-csv_file_path = None  # Current CSV file path
+
+# CSV handling
+csv_file_handle = None
 
 # Synchronization primitives
 i2c_lock = threading.Lock()
@@ -619,7 +618,6 @@ shutdown_requested = threading.Event()
 enable_from_pc = threading.Event()
 simulate_start = threading.Event()
 sampling_active = threading.Event()
-continuous_sampling_active = threading.Event()  # Für kontinuierliches Abtasten
 
 # Setup logging
 logger = logging.getLogger("qumat628")
@@ -668,59 +666,60 @@ def setup_logging() -> None:
     return logger
 
 # ===== CSV Logging Functions =====
-def create_new_csv_file() -> str:
+def initialize_csv_file() -> bool:
     """
-    Create a new CSV file with timestamp for logging Delphi data.
-    
-    Returns:
-        Path to the created CSV file
+    Initialize the single CSV file for logging all Delphi data.
     """
-    global csv_file_path
+    global csv_file_handle
     
     try:
-        # Create filename with timestamp
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{Config.CSV_BASE_FILENAME}_{timestamp}.csv"
+        # Close any existing file handle
+        if csv_file_handle is not None:
+            try:
+                csv_file_handle.flush()
+                csv_file_handle.close()
+            except Exception as e:
+                logger.error(f"❌ Error closing previous CSV file: {e}")
         
-        # Create CSV with headers
-        with open(filename, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
+        # Open CSV file in append mode
+        csv_file_handle = open(Config.CSV_FILENAME, 'a', newline='')
+        writer = csv.writer(csv_file_handle)
+        
+        # If file is new (empty), write headers
+        if os.path.getsize(Config.CSV_FILENAME) == 0:
             writer.writerow([
-                'Timestamp', 'DateTime', 'PacketID', 
+                'Timestamp', 'DateTime', 'PacketID', 'MeasurementID',
                 'SampleIndex', 'RawValue', 'SentValue', 'Voltage',
-                'ScaledValue',                        # NEW: Add scaled value column
-                'VirtualIndex', 'VirtualTime',        # Virtual sample metadata
-                'Runtime', 'HV_Status', 'HV_DC', 'HV_AC', 'DAC_Voltage',
-                'Temperature', 'Humidity', 'MeasurementActive',
-                'Q628State', 'MotorPosition', 'ValveStatus',
-                'Interpolated', 'ScalingFactor'       # NEW: Add scaling factor column
+                'ScaledValue', 'VirtualIndex', 'Runtime', 'HV_Status', 
+                'HV_DC', 'HV_AC', 'DAC_Voltage', 'Temperature', 'Humidity', 
+                'MeasurementActive', 'Q628State', 'MotorPosition', 'ValveStatus'
             ])
         
-        logger.info(f"📊 Created new CSV log file: {filename}")
-        csv_file_path = filename
-        return filename
+        csv_file_handle.flush()
+        logger.info(f"📊 Initialized CSV log file: {Config.CSV_FILENAME}")
+        return True
         
     except Exception as e:
-        logger.error(f"❌ Error creating CSV file: {e}")
-        return None
-
+        logger.error(f"❌ Error initializing CSV file: {e}")
+        return False
+    
 def log_samples_to_csv(samples: list, packet_id: int, start_index: int) -> None:
     """
-    Log samples sent to Delphi to a CSV file.
+    Log samples sent to Delphi to the CSV file.
     
     Args:
-        samples: List of tuples (raw_value, sent_value, is_interpolated, virtual_index)
+        samples: List of tuples (raw_value, sent_value, is_virtual, virtual_index)
         packet_id: Unique ID for this packet
         start_index: Starting index in the measurement
     """
-    global csv_file_path
+    global csv_file_handle
     
     if not Config.CSV_ENABLED or not samples:
         return
         
-    if csv_file_path is None:
-        csv_file_path = create_new_csv_file()
-        if csv_file_path is None:
+    if csv_file_handle is None:
+        initialize_csv_file()
+        if csv_file_handle is None:
             return
     
     try:
@@ -728,51 +727,51 @@ def log_samples_to_csv(samples: list, packet_id: int, start_index: int) -> None:
         current_time = time.time()
         dt_str = datetime.datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         
+        # Generate a unique measurement ID based on start time
+        measurement_id = f"{state_dict['measurement_start_time']}" if state_dict["measurement_start_time"] else "IDLE"
+        
         # Calculate DAC voltage from HV DC value
         dac_voltage = state_dict["hv_dc_value"] / 2000.0
         
-        with open(csv_file_path, 'a', newline='') as csvfile:
-            writer = csv.writer(csvfile)
+        writer = csv.writer(csv_file_handle)
+        
+        for i, (raw_value, sent_value, is_virtual, virtual_idx) in enumerate(samples):
+            # Calculate voltage from raw ADC value
+            voltage = (float(raw_value) / ((1 << 21) - 1)) * Config.VREF_ADC * 2
             
-            for i, (raw_value, sent_value, is_interpolated, virtual_idx) in enumerate(samples):
-                # Calculate voltage from raw ADC value
-                voltage = (float(raw_value) / ((1 << 21) - 1)) * Config.VREF_ADC * 2
-                
-                # Calculate absolute sample index
-                abs_index = start_index + i
-                
-                # Calculate virtual time (in 100Hz grid)
-                virtual_time = virtual_idx / 100.0
-                
-                # Calculate scaled value for comparison with sent value
-                scaled_value = raw_value * SCALE_FACTOR
-                
-                # Write complete row with all context data
-                writer.writerow([
-                    f"{current_time:.6f}",                 # Timestamp
-                    dt_str,                                # Human-readable datetime
-                    packet_id,                             # Packet ID
-                    abs_index,                             # Sample index in measurement
-                    raw_value,                             # Raw 22-bit ADC value
-                    sent_value,                            # Value sent to Delphi (scaled)
-                    f"{voltage:.6f}",                      # Calculated voltage
-                    scaled_value,                          # NEW: Scaled value for debugging
-                    virtual_idx,                           # Virtual sample index (100Hz grid)
-                    f"{virtual_time:.3f}",                 # Virtual time in seconds (100Hz grid)
-                    state_dict["runtime"],                 # Runtime in seconds
-                    "ON" if state_dict["hv_status"] else "OFF",  # HV status
-                    state_dict["hv_dc_value"],             # HV DC value
-                    state_dict["hv_ac_value"],             # HV AC value
-                    f"{dac_voltage:.6f}",                  # DAC voltage
-                    f"{state_dict['temperature']:.2f}",    # Temperature
-                    f"{state_dict['humidity']:.2f}",       # Humidity
-                    "YES" if state_dict["measurement_active"] else "NO",  # Measurement active
-                    state_dict["q628_state"].name,         # Q628 state
-                    str(state_dict["motor_position"]),     # Motor position
-                    str(state_dict["valve_status"]),       # Valve status
-                    "YES" if is_interpolated else "NO",    # Interpolated flag
-                    f"{SCALE_FACTOR}",                     # NEW: Scaling factor used
-                ])
+            # Calculate absolute sample index
+            abs_index = start_index + i
+            
+            # Calculate scaled value for comparison with sent value
+            scaled_value = raw_value * SCALE_FACTOR
+            
+            # Write complete row with all context data
+            writer.writerow([
+                f"{current_time:.6f}",                 # Timestamp
+                dt_str,                                # Human-readable datetime
+                packet_id,                             # Packet ID
+                measurement_id,                        # Measurement ID
+                abs_index,                             # Sample index in measurement
+                raw_value,                             # Raw 22-bit ADC value
+                sent_value,                            # Value sent to Delphi (scaled)
+                f"{voltage:.6f}",                      # Calculated voltage
+                scaled_value,                          # Scaled value for debugging
+                virtual_idx,                           # Virtual sample index (100Hz grid)
+                state_dict["runtime"],                 # Runtime in seconds
+                "ON" if state_dict["hv_status"] else "OFF",  # HV status
+                state_dict["hv_dc_value"],             # HV DC value
+                state_dict["hv_ac_value"],             # HV AC value
+                f"{dac_voltage:.6f}",                  # DAC voltage
+                f"{state_dict['temperature']:.2f}",    # Temperature
+                f"{state_dict['humidity']:.2f}",       # Humidity
+                "YES" if state_dict["measurement_active"] else "NO",  # Measurement active
+                state_dict["q628_state"].name,         # Q628 state
+                str(state_dict["motor_position"]),     # Motor position
+                str(state_dict["valve_status"]),       # Valve status
+            ])
+        
+        # Flush after every batch of samples
+        csv_file_handle.flush()
                 
         # Log status periodically to avoid flooding logs
         if packet_id % 10 == 0:
@@ -781,11 +780,9 @@ def log_samples_to_csv(samples: list, packet_id: int, start_index: int) -> None:
     except Exception as e:
         logger.error(f"❌ Error logging samples to CSV: {e}")
 
-        
 def initialize_hardware() -> bool:
-    """Initialize hardware with comprehensive error checking and 50Hz continuous sampling"""
+    """Initialize hardware with comprehensive error checking"""
     logger.info("🔌 Initializing hardware...")
-
     try:
         global i2c_bus
         i2c_bus = smbus2.SMBus(1)
@@ -863,27 +860,12 @@ def initialize_hardware() -> bool:
         ).start()
         logger.info("✅ Motor status monitoring started")
 
-  
-        # Start continuous ADC sampling thread at fixed 16.67Hz
-        threading.Thread(
-            target=continuous_adc_sampling_thread,
-            daemon=True
-        ).start()
-        logger.info("✅ Continuous 16.67Hz ADC sampling started")
-
-        # Start virtual interpolation thread to create 100Hz timeline
-        threading.Thread(
-            target=virtual_sampling_thread,
-            daemon=True
-        ).start()
-        logger.info("✅ Virtual 100Hz interpolation thread started")
-
-        # Start ADC monitoring thread (handles state transitions, not sampling)
+        # Start 50Hz ADC sampling thread
         threading.Thread(
             target=adc_sampling_thread,
             daemon=True
         ).start()
-        logger.info("✅ ADC state monitoring thread started")
+        logger.info("✅ 50Hz ADC sampling started")
 
         # Start temperature/humidity monitoring
         threading.Thread(
@@ -906,13 +888,17 @@ def initialize_hardware() -> bool:
         ).start()
         logger.info("✅ LED status indication started")
 
+    
+            # Initialize CSV file if enabled
+        if Config.CSV_ENABLED:
+            initialize_csv_file()
+
         logger.info("✅ Hardware initialization completed successfully")
         return True
-
+    
     except Exception as e:
-        logger.error("❌ Hardware initialization failed: %s", e, exc_info=True)
-        return False
-
+            logger.error("❌ Hardware initialization failed: %s", e, exc_info=True)
+            return False
 
 def temperature_humidity_monitor() -> None:
     """
@@ -939,18 +925,16 @@ def temperature_humidity_monitor() -> None:
 
     logger.info("🌡️ Temperature and humidity monitoring terminated")
 
-# Key changes to make:
-# 1. Remove the virtual_sampling_thread that performs interpolation
-# 2. Continue sampling at natural 60 Hz rate
-# 3. Map the real 60 Hz time axis to a virtual 100 Hz grid for Delphi without interpolation
-# 4. Ensure that runtime calculation matches what Delphi expects
-def continuous_adc_sampling_thread() -> None:
+def adc_sampling_thread() -> None:
     """
-    Thread for continuous ADC sampling at precise 16.67Hz (60ms).
-    Optimized for maximum real-world performance.
+    Thread for 50Hz ADC sampling with precise timing control.
+    Each real sample is duplicated to create a 100Hz timeline.
+    Ensures exact sample count regardless of timing drift.
     """
-    logger.info("📊 Continuous ADC sampling started at 16.67Hz target")
+    logger.info("📊 ADC sampling started at 50Hz with 100Hz virtual grid mapping")
+    
     sample_count = 0
+    real_sample_count = 0
     
     # Perform initial soft reset
     GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
@@ -958,40 +942,23 @@ def continuous_adc_sampling_thread() -> None:
     GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
     time.sleep(0.02)
     
-    # Use monotonic time for precise timing
+    # Use monotonic clock for accurate timing
     next_sample_time = time.monotonic()
-    start_time = next_sample_time
-    TARGET_RATE = 16.67  # Target Hz
-    ACTUAL_SAMPLE_INTERVAL = 1.0 / TARGET_RATE  # ~60ms
-    
-    # Timing diagnostics
-    read_times = []
-    
-    # Runtime tracking
     last_stats_time = time.monotonic()
+    
+    # Target rate and interval for strict timing
+    TARGET_RATE = Config.ADC_TARGET_RATE
+    SAMPLE_INTERVAL = 1.0 / TARGET_RATE  # 20ms for 50Hz
     
     while not shutdown_requested.is_set():
         try:
-            # Measure how long the ADC read takes
-            read_start = time.monotonic()
-            
-            # Read ADC at precise intervals
-            raw_value = read_adc_22bit()
             current_time = time.monotonic()
             
-            # Track read time for performance tuning
-            read_time = current_time - read_start
-            read_times.append(read_time)
-            if len(read_times) > 100:
-                read_times.pop(0)
-            
-            if raw_value != 0:
-                # Store raw value with timestamp
-                with sample_lock:
-                    # Store current sample with timestamp
-                    if len(last_two_samples) >= 2:
-                        last_two_samples.pop(0)  # Remove oldest
-                    last_two_samples.append((current_time, raw_value))
+            # Take sample at precise intervals (50Hz)
+            if current_time >= next_sample_time:
+                # Read ADC value
+                raw_value = read_adc_22bit()
+                sample_timestamp = time.time()
                 
                 # Store state values
                 system_state.set("field_strength", raw_value)
@@ -1001,320 +968,75 @@ def continuous_adc_sampling_thread() -> None:
                 vref = Config.VREF_ADC
                 voltage = (float(raw_value) / ((1 << 21) - 1)) * vref * 2
                 
-                # Store in buffer
-                adc_buffer.enqueue(raw_value)
+                # Store in buffer and add to system state
+                adc_buffer.enqueue((sample_timestamp, raw_value))
                 system_state.add_adc_data(raw_value)
+                
+                # If sampling is active, map this 50Hz sample to 100Hz grid (duplicate samples)
+                if sampling_active.is_set() and system_state.is_sampling_active():
+                    # Add this sample to virtual buffer 
+                    virtual_idx = system_state.get("virtual_sample_count")
+                    
+                    # Add sample to virtual buffer with data: (value, is_virtual, virtual_idx)
+                    virtual_buffer.enqueue((raw_value, False, virtual_idx))
+                    
+                    # Increment virtual sample count by 1
+                    system_state.increment_virtual_sample_count()
+                    
+                    # Add a duplicate sample to virtual buffer
+                    virtual_idx = system_state.get("virtual_sample_count")
+                    virtual_buffer.enqueue((raw_value, True, virtual_idx))
+                    
+                    # Increment virtual sample count by 1 for the duplicate
+                    system_state.increment_virtual_sample_count()
+                    
+                    # CRITICAL: Check if we've reached the exact sample count
+                    virtual_count = system_state.get("virtual_sample_count")
+                    expected_count = system_state.get("total_expected_samples")
+                    
+                    # Every 100 samples, log progress
+                    if virtual_count % 100 == 0:
+                        logger.debug(f"📊 Virtual samples: {virtual_count}/{expected_count} " +
+                                   f"({virtual_count/expected_count*100:.1f}%)")
                 
                 # Update sample count for logging
                 sample_count += 1
+                real_sample_count += 1
+                
+                # Schedule next sample with precise timing
+                next_sample_time += SAMPLE_INTERVAL
+                
+                # If we're too far behind schedule (more than 2 intervals), reset timing
+                if current_time > next_sample_time + (2 * SAMPLE_INTERVAL):
+                    logger.warning(f"⚠️ ADC sampling falling too far behind - resetting timing")
+                    next_sample_time = current_time + SAMPLE_INTERVAL
             
             # Show sampling statistics every 5 seconds
             if current_time - last_stats_time >= 5.0:
-                elapsed = current_time - start_time
+                elapsed = current_time - last_stats_time
                 actual_rate = sample_count / elapsed if elapsed > 0 else 0
-                avg_read_time = sum(read_times) / len(read_times) if read_times else 0
+                sample_count = 0  # Reset for next period
                 
-                logger.info(f"📊 ADC sampling stats: {sample_count} samples at {actual_rate:.2f} Hz " +
-                           f"(target: {TARGET_RATE:.2f} Hz), avg read time: {avg_read_time*1000:.2f}ms")
-                
-                # Adjust timing if we're falling below 15 Hz
-                if actual_rate < 15.0 and avg_read_time > 0:
-                    # Reduce the delay proportionally
-                    adjustment = min(0.01, avg_read_time * 0.1)  # Max 10ms adjustment
-                    ACTUAL_SAMPLE_INTERVAL = max(0.01, ACTUAL_SAMPLE_INTERVAL - adjustment)
-                    logger.warning(f"⚠️ ADC rate too low - adjusting interval to {ACTUAL_SAMPLE_INTERVAL*1000:.2f}ms " +
-                                   f"to compensate for {avg_read_time*1000:.2f}ms read time")
+                # Log real and virtual sample rates
+                virtual_count = system_state.get("virtual_sample_count")
+                expected_count = system_state.get("total_expected_samples")
+                if expected_count > 0:
+                    progress = (virtual_count / expected_count) * 100
+                    logger.info(f"📊 ADC sampling stats: {actual_rate:.2f} Hz real rate, " +
+                              f"{virtual_count} virtual samples ({progress:.1f}% complete)")
+                else:
+                    logger.info(f"📊 ADC sampling stats: {actual_rate:.2f} Hz real rate")
                 
                 last_stats_time = current_time
             
-            # Schedule next sample with precise timing
-            next_sample_time += ACTUAL_SAMPLE_INTERVAL
-            sleep_time = next_sample_time - time.monotonic()
-            
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # We're falling behind schedule
-                if sleep_time < -0.05:  # Only log if we're significantly behind
-                    logger.warning(f"⚠️ ADC sampling falling behind by {-sleep_time:.3f}s - adjusting")
-                    # Reset timing if we fall too far behind
-                    next_sample_time = time.monotonic() + ACTUAL_SAMPLE_INTERVAL
+            # Sleep efficiently until next sample time
+            remaining_time = next_sample_time - time.monotonic()
+            if remaining_time > 0:
+                time.sleep(min(remaining_time, 0.001))  # Sleep at most 1ms for responsiveness
                 
         except Exception as e:
-            logger.error(f"❌ Error in continuous ADC sampling: {e}")
+            logger.error(f"❌ Error in ADC sampling: {e}")
             time.sleep(0.1)  # Short pause on errors
-
-def interpolate_value(time_point: float) -> Tuple[int, bool]:
-    """
-    Interpolate a value at the given time point using the last two real samples.
-    If no samples are available, creates reasonable estimates.
-    
-    Args:
-        time_point: Time point to interpolate at
-    
-    Returns:
-        Tuple of (interpolated value, is_interpolated flag)
-    """
-    with sample_lock:
-        # If we don't have two samples yet, return the latest or zero
-        if len(last_two_samples) == 0:
-            return 0, True  # No samples yet, return zero with interpolated flag
-        
-        if len(last_two_samples) == 1:
-            return last_two_samples[0][1], False  # Return the only sample (not interpolated)
-        
-        # Get the two samples with timestamps
-        (t1, v1), (t2, v2) = last_two_samples
-        
-        # If the time point is outside the range of our samples
-        if time_point <= t1:
-            return v1, False  # Return the earlier sample (not interpolated)
-        if time_point >= t2:
-            return v2, False  # Return the later sample (not interpolated)
-        
-        # Calculate linear interpolation
-        # y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
-        ratio = (time_point - t1) / (t2 - t1)
-        interpolated = v1 + int(ratio * (v2 - v1))
-        
-        return interpolated, True  # Return interpolated value with flag
-
-def virtual_sampling_thread() -> None:
-    """
-    Generate virtual 100Hz sampling grid by interpolating between real samples.
-    Optimized to maintain real-time performance by processing in batches.
-    """
-    logger.info("📊 Virtual 100Hz sampling interpolation started")
-    
-    # Initialize timing variables
-    virtual_sample_count = 0
-    virtual_start_time = None
-    last_log_time = 0
-    last_batch_time = 0
-    
-    # Virtual sample interval = 10ms (100Hz)
-    VIRTUAL_SAMPLE_INTERVAL = 0.01
-    BATCH_INTERVAL = 0.2  # Process in 200ms batches (20 virtual samples)
-    
-    while not shutdown_requested.is_set():
-        try:
-            current_time = time.monotonic()
-            
-            # Only process during active measurement
-            if sampling_active.is_set() and system_state.is_sampling_active():
-                # Initialize start time if needed
-                if virtual_start_time is None:
-                    virtual_start_time = current_time
-                    last_batch_time = current_time
-                    logger.info(f"📊 Virtual sampling grid initialized at {virtual_start_time}")
-                
-                # Check if it's time to process a batch of virtual samples
-                if current_time - last_batch_time >= BATCH_INTERVAL:
-                    # Calculate virtual sample times for this batch
-                    elapsed = current_time - virtual_start_time
-                    
-                    # How many virtual samples should we have by now?
-                    target_count = int(elapsed / VIRTUAL_SAMPLE_INTERVAL)
-                    
-                    # Calculate how many samples to generate in this batch
-                    batch_start = virtual_sample_count
-                    batch_end = min(target_count, batch_start + 50)  # Limit batch size
-                    
-                    # Generate the batch of virtual samples
-                    for i in range(batch_start, batch_end):
-                        # Calculate exact virtual time point
-                        virtual_time = virtual_start_time + (i * VIRTUAL_SAMPLE_INTERVAL)
-                        
-                        # Get interpolated value at this exact time
-                        value, is_interpolated = interpolate_value(virtual_time)
-                        
-                        # Add to virtual buffer with metadata
-                        virtual_buffer.enqueue((value, is_interpolated, i))
-                    
-                    # Update count and batch time
-                    if batch_end > virtual_sample_count:
-                        virtual_sample_count = batch_end
-                        last_batch_time = current_time
-                    
-                    # Log statistics periodically (every second)
-                    if current_time - last_log_time > 1.0:
-                        logger.debug(f"📊 Generated {virtual_sample_count} virtual samples at 100Hz grid " +
-                                   f"({virtual_sample_count/elapsed if elapsed > 0 else 0:.1f} Hz effective)")
-                        last_log_time = current_time
-                
-                # Check if we've reached exact sample count limit
-                defined_time = system_state.get("defined_measurement_time")
-                expected_samples = int(defined_time * 100)
-                
-                if virtual_sample_count >= expected_samples:
-                    logger.info(f"📊 Reached exact virtual sample count: {virtual_sample_count}/{expected_samples}")
-                    if system_state.get_q628_state() == Q628State.ACTIV:
-                        system_state.enforce_sample_count_limit()
-            else:
-                # Reset timing if sampling not active
-                virtual_start_time = None
-                virtual_sample_count = 0
-                
-            # Sleep briefly to prevent CPU hogging
-            time.sleep(0.005)
-            
-        except Exception as e:
-            logger.error(f"❌ Error in virtual sampling: {e}")
-            time.sleep(0.1)
-
-def motor_status_monitor() -> None:
-    """
-    Continuously monitor motor status in a separate thread
-    """
-    logger.info("🔄 Motor status monitoring started")
-    error_logged = False  # Track if we've already logged an error
-    last_status = None
-
-    while not shutdown_requested.is_set():
-        try:
-            status = read_motor_status()
-            if status:
-                # Log full status periodically
-                if status != last_status:
-                    logger.debug("Motor status changed: %s", status)
-                    last_status = status
-
-                # If motor is in error state, log it (but avoid spamming logs)
-                if status & MotorStatus.ERROR:
-                    if not error_logged:
-                        logger.warning("⚠️ Motor error detected! Status: %s", status)
-                        error_logged = True
-                else:
-                    # Reset the error logged flag when error clears
-                    error_logged = False
-
-                # If motor just reached home position, log it
-                prev_status = system_state.get("motor_status")
-                if (status & MotorStatus.HOME) and not (prev_status & MotorStatus.HOME):
-                    logger.info("🏠 Motor reached home position")
-
-                # If motor just finished being busy, log it
-                if (prev_status & MotorStatus.BUSY) and not (status & MotorStatus.BUSY):
-                    logger.info("✅ Motor operation completed")
-        except Exception as e:
-            logger.error("❌ Error in motor status monitor: %s", e)
-
-        # Sleep before next poll
-        time.sleep(Config.MOTOR_STATUS_POLL_INTERVAL)
-
-
-def move_motor(position: MotorPosition) -> bool:
-    """
-    Move motor to specified position
-
-    Args:
-        position: MotorPosition.UP or MotorPosition.DOWN
-
-    Returns:
-        True if successful, False if error occurred
-    """
-    position_str = str(position)
-    logger.info("🛠️ Moving motor: %s", position_str.upper())
-
-    try:
-        system_state.set("motor_position", position)
-
-        # Check current motor status
-        status = read_motor_status()
-        if status and (status & MotorStatus.BUSY):
-            logger.warning("⚠️ Motor is busy, waiting before sending new command")
-            # Wait for motor to be ready (up to 5 seconds)
-            for _ in range(50):  # 50 * 0.1s = 5s
-                if shutdown_requested.is_set():
-                    return False
-                time.sleep(0.1)
-                status = read_motor_status()
-                if status and not (status & MotorStatus.BUSY):
-                    break
-            else:
-                logger.error("❌ Motor still busy after timeout, forcing command")
-
-        # Send appropriate command to motor controller
-        cmd = Config.CMD_UP if position == MotorPosition.UP else Config.CMD_DOWN
-        with i2c_lock:
-                        i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, cmd)
-
-        # Wait briefly and check if command was accepted
-        time.sleep(0.1)
-        status = read_motor_status()
-        if status and (status & MotorStatus.BUSY):
-            logger.info("✅ Motor command accepted, motor is now busy")
-            return True
-        else:
-            return True  # Still return True as we did send the command
-    except Exception as e:
-        logger.error("❌ Error moving motor: %s", e)
-        system_state.set("last_error", f"Motor error: {str(e)}")
-        return False
-
-
-def set_high_voltage(enabled: bool) -> None:
-    """
-    Enable or disable high voltage (both AC and DC)
-    
-    When enabled, sets the DAC voltage according to the 1:2000 ratio
-    for the configured HV DC value.
-    """
-    status_text = 'ON' if enabled else 'OFF'
-    logger.info("⚡ High voltage: %s", status_text)
-
-    try:
-        system_state.set("hv_status", enabled)
-        
-        if enabled:
-            # Get configured HV DC value
-            hv_dc = system_state.get("hv_dc_value")
-            
-            # Calculate DAC voltage using the 1:2000 ratio (6500V = 3.25V DAC)
-            dac_voltage = hv_dc / 2000.0
-            
-            # Apply the voltage to the DAC
-            set_dac_voltage(dac_voltage)
-            
-            # Then activate the HV AC/DC GPIO
-            GPIO.output(Config.HVAC_GPIO, GPIO.HIGH)
-            
-            # Log the values being applied
-            hv_ac = system_state.get("hv_ac_value")
-            logger.info(f"⚡ Applied voltage values - AC:{hv_ac}V, DC:{hv_dc}V (DAC={dac_voltage:.4f}V)")
-        else:
-            # Turn off the main HV AC/DC GPIO
-            GPIO.output(Config.HVAC_GPIO, GPIO.LOW)
-            
-            # Set DAC to zero when turning off HV
-            set_dac_voltage(0.0)
-            logger.info("⚡ High voltage turned OFF, DAC set to 0V")
-        
-    except Exception as e:
-        logger.error("❌ Error setting high voltage: %s", e)
-        system_state.set("last_error", f"HV error: {str(e)}")
-
-
-def set_valve(status: ValveStatus) -> None:
-    """
-    Set valve status (open/closed)
-
-    Args:
-        status: ValveStatus.OPEN or ValveStatus.CLOSED
-    """
-    status_str = str(status)
-    logger.info("🔧 Setting valve: %s", status_str.upper())
-
-    try:
-        system_state.set("valve_status", status)
-
-        # Both magnets are controlled together
-        gpio_state = GPIO.HIGH if status == ValveStatus.OPEN else GPIO.LOW
-        GPIO.output(Config.MAGNET1_GPIO, gpio_state)
-        GPIO.output(Config.MAGNET2_GPIO, gpio_state)
-    except Exception as e:
-        logger.error("❌ Error setting valve: %s", e)
-        system_state.set("last_error", f"Valve error: {str(e)}")
 
 
 def read_motor_status() -> Optional[MotorStatus]:
@@ -1383,10 +1105,10 @@ def read_temperature_humidity() -> Tuple[float, float]:
         logger.error("❌ Error reading temperature/humidity: %s", e)
         return (23.5, 45.0)  # Return default values on error
 
+
 def read_adc_22bit() -> int:
     """
     Read 22-bit raw value from MCP3553SN ADC using simplified, reliable implementation.
-    Maintains 16.67 Hz sampling rate with reset after each sample.
     
     Returns:
         Raw signed integer ADC value
@@ -1408,7 +1130,7 @@ def read_adc_22bit() -> int:
                 logger.warning("MCP3553 data not ready - performing soft reset and returning 0")
                 # Force reset when not ready
                 GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
-                time.sleep(0.01)
+                time.sleep(0.0005)
                 GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
                 return 0
             
@@ -1430,9 +1152,9 @@ def read_adc_22bit() -> int:
             if signed_value & (1 << 21):
                 signed_value -= (1 << 22)
             
-            # CRITICAL: Reset AFTER each sample as per the working example
+            # Reset AFTER each sample
             GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
-            time.sleep(0.01)
+            time.sleep(0.0005)
             GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
             
             return signed_value
@@ -1441,7 +1163,7 @@ def read_adc_22bit() -> int:
             logger.error(f"❌ MCP3553 SPI read error: {e}")
             # Ensure CS is reset on error
             GPIO.output(Config.PIN_CS_ADC, GPIO.HIGH)
-            time.sleep(0.01)
+            time.sleep(0.0005)
             GPIO.output(Config.PIN_CS_ADC, GPIO.LOW)
             return 0
 
@@ -1525,48 +1247,159 @@ def set_dac_voltage_for_hv_dc(hv_dc_value: int) -> None:
     system_state.set("hv_dc_value", hv_dc_value)
 
 
-def adc_sampling_thread() -> None:
+def motor_status_monitor() -> None:
     """
-    Legacy ADC sampling thread - now just monitors sampling status.
-    Actual sampling happens in continuous_adc_sampling_thread and virtual_sampling_thread.
+    Continuously monitor motor status in a separate thread
     """
-    logger.info("🔄 ADC sampling monitor started (sampling now handled by continuous thread)")
-    
+    logger.info("🔄 Motor status monitoring started")
+    error_logged = False  # Track if we've already logged an error
+    last_status = None
+
     while not shutdown_requested.is_set():
         try:
-            # Only handle state transitions and logging
-            if sampling_active.is_set():
-                # Monitor sampling status for logging purposes
-                current_time = time.time()
-                button_press_time = system_state.get("button_press_time")
-                
-                if button_press_time is not None:
-                    elapsed_time = current_time - button_press_time
-                    
-                    # Check if measurement should end
-                    defined_time = system_state.get("defined_measurement_time")
-                    if elapsed_time >= defined_time:
-                        logger.info(f"⏱️ Measurement duration reached: {elapsed_time:.2f}s / {defined_time}s")
-                        
-                        # Get real sample count
-                        samples = len(virtual_buffer.get_all())
-                        expected = int(defined_time * Config.VIRTUAL_SAMPLE_RATE)
-                        logger.info(f"Measurement complete with {samples}/{expected} virtual samples at 100Hz")
-                        
-                        # End sampling state
-                        sampling_active.clear()
-                        system_state.stop_sampling()
-                        
-                        # Transition state machine
-                        if system_state.get_q628_state() == Q628State.ACTIV:
-                            system_state.set_q628_state(Q628State.FINISH)
-            
-            # Sleep longer - just monitoring state
-            time.sleep(0.1)
-                
+            status = read_motor_status()
+            if status:
+                # Log full status periodically
+                if status != last_status:
+                    logger.debug("Motor status changed: %s", status)
+                    last_status = status
+
+                # If motor is in error state, log it (but avoid spamming logs)
+                if status & MotorStatus.ERROR:
+                    if not error_logged:
+                        logger.warning("⚠️ Motor error detected! Status: %s", status)
+                        error_logged = True
+                else:
+                    # Reset the error logged flag when error clears
+                    error_logged = False
+
+                # If motor just reached home position, log it
+                prev_status = system_state.get("motor_status")
+                if (status & MotorStatus.HOME) and not (prev_status & MotorStatus.HOME):
+                    logger.info("🏠 Motor reached home position")
+
+                # If motor just finished being busy, log it
+                if (prev_status & MotorStatus.BUSY) and not (status & MotorStatus.BUSY):
+                    logger.info("✅ Motor operation completed")
         except Exception as e:
-            logger.error(f"❌ Error in ADC sampling monitor: {e}", exc_info=True)
-            time.sleep(1.0)
+            logger.error("❌ Error in motor status monitor: %s", e)
+
+        # Sleep before next poll
+        time.sleep(Config.MOTOR_STATUS_POLL_INTERVAL)
+
+
+def move_motor(position: MotorPosition) -> bool:
+    """
+    Move motor to specified position
+
+    Args:
+        position: MotorPosition.UP or MotorPosition.DOWN
+
+    Returns:
+        True if successful, False if error occurred
+    """
+    position_str = str(position)
+    logger.info("🛠️ Moving motor: %s", position_str.upper())
+
+    try:
+        system_state.set("motor_position", position)
+
+        # Check current motor status
+        status = read_motor_status()
+        if status and (status & MotorStatus.BUSY):
+            logger.warning("⚠️ Motor is busy, waiting before sending new command")
+            # Wait for motor to be ready (up to 5 seconds)
+            for _ in range(50):  # 50 * 0.1s = 5s
+                if shutdown_requested.is_set():
+                    return False
+                time.sleep(0.1)
+                status = read_motor_status()
+                if status and not (status & MotorStatus.BUSY):
+                    break
+            else:
+                logger.error("❌ Motor still busy after timeout, forcing command")
+
+        # Send appropriate command to motor controller
+        cmd = Config.CMD_UP if position == MotorPosition.UP else Config.CMD_DOWN
+        with i2c_lock:
+            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, cmd)
+
+        # Wait briefly and check if command was accepted
+        time.sleep(0.1)
+        status = read_motor_status()
+        if status and (status & MotorStatus.BUSY):
+            logger.info("✅ Motor command accepted, motor is now busy")
+            return True
+        else:
+            return True  # Still return True as we did send the command
+    except Exception as e:
+        logger.error("❌ Error moving motor: %s", e)
+        system_state.set("last_error", f"Motor error: {str(e)}")
+        return False
+
+
+def set_high_voltage(enabled: bool) -> None:
+    """
+    Enable or disable high voltage (both AC and DC)
+    
+    When enabled, sets the DAC voltage according to the 1:2000 ratio
+    for the configured HV DC value.
+    """
+    status_text = 'ON' if enabled else 'OFF'
+    logger.info("⚡ High voltage: %s", status_text)
+
+    try:
+        system_state.set("hv_status", enabled)
+        
+        if enabled:
+            # Get configured HV DC value
+            hv_dc = system_state.get("hv_dc_value")
+            
+            # Calculate DAC voltage using the 1:2000 ratio (6500V = 3.25V DAC)
+            dac_voltage = hv_dc / 2000.0
+            
+            # Apply the voltage to the DAC
+            set_dac_voltage(dac_voltage)
+            
+            # Then activate the HV AC/DC GPIO
+            GPIO.output(Config.HVAC_GPIO, GPIO.HIGH)
+            
+            # Log the values being applied
+            hv_ac = system_state.get("hv_ac_value")
+            logger.info(f"⚡ Applied voltage values - AC:{hv_ac}V, DC:{hv_dc}V (DAC={dac_voltage:.4f}V)")
+        else:
+            # Turn off the main HV AC/DC GPIO
+            GPIO.output(Config.HVAC_GPIO, GPIO.LOW)
+            
+            # Set DAC to zero when turning off HV
+            set_dac_voltage(0.0)
+            logger.info("⚡ High voltage turned OFF, DAC set to 0V")
+        
+    except Exception as e:
+        logger.error("❌ Error setting high voltage: %s", e)
+        system_state.set("last_error", f"HV error: {str(e)}")
+
+
+def set_valve(status: ValveStatus) -> None:
+    """
+    Set valve status (open/closed)
+
+    Args:
+        status: ValveStatus.OPEN or ValveStatus.CLOSED
+    """
+    status_str = str(status)
+    logger.info("🔧 Setting valve: %s", status_str.upper())
+
+    try:
+        system_state.set("valve_status", status)
+
+        # Both magnets are controlled together
+        gpio_state = GPIO.HIGH if status == ValveStatus.OPEN else GPIO.LOW
+        GPIO.output(Config.MAGNET1_GPIO, gpio_state)
+        GPIO.output(Config.MAGNET2_GPIO, gpio_state)
+    except Exception as e:
+        logger.error("❌ Error setting valve: %s", e)
+        system_state.set("last_error", f"Valve error: {str(e)}")
 
 
 def led_control_thread() -> None:
@@ -1662,59 +1495,44 @@ def start_sampling() -> None:
     
     # Clear buffer for a fresh start
     adc_buffer.clear()
+    virtual_buffer.clear()
     system_state.clear_adc_data()
     
     # Reset transmission tracking
     last_sent_index = 0
+    
+    # Reset the virtual sample count
+    system_state.set("virtual_sample_count", 0)
     
     # Mark the sampling as active for the state machine
     system_state.start_sampling()
     sampling_active.set()
 
 
-# Create a thread-safe flag to coordinate measurement ending
-measurement_ending_lock = threading.Lock()
-measurement_already_ending = False
-
 def stop_sampling() -> None:
     """
     Stop ADC sampling with coordinated shutdown.
-    IMPORTANT: This does not clear the buffer to ensure all data is transmitted.
+    Finalizes CSV files with the correct end timestamp.
     """
-    global measurement_already_ending
-    
-    with measurement_ending_lock:
-        # Check if measurement is already being stopped by another thread
-        if measurement_already_ending:
-            logger.debug("📊 Sampling stop already in progress - skipping redundant call")
-            return
-            
-        # Mark measurement as ending
-        measurement_already_ending = True
-    
-    logger.info("📊 Stopping ADC sampling - ensuring data will still be transmitted") 
+    logger.info("📊 Stopping sampling") 
     sampling_active.clear()
-    system_state.stop_sampling()  # Clear sampling active flag in system state
+    system_state.stop_sampling()
     
     # Log buffer statistics
     defined_time = system_state.get("defined_measurement_time")
     expected_virtual_samples = int(defined_time * 100)  # 100Hz expected by Delphi
-    current_samples = len(adc_buffer.get_all())
+    current_virtual_samples = system_state.get("virtual_sample_count")
     
-    logger.info(f"📊 Sampling stopped with {current_samples} real samples in buffer")
+    logger.info(f"📊 Sampling stopped with {current_virtual_samples}/{expected_virtual_samples} virtual samples")
     logger.info(f"📊 {last_sent_index} samples sent to client so far")
-    logger.info(f"📊 {current_samples - last_sent_index} samples remaining to be sent")
-    
-    # IMPORTANT: Do NOT clear the buffer here, as we still need to send remaining data
-    
-    # Reset flag after a short delay to allow for proper cleanup
-    def reset_flag():
-        global measurement_already_ending
-        time.sleep(1.0)  # Wait for other threads to notice sampling is inactive
-        with measurement_ending_lock:
-            measurement_already_ending = False
-    
-    threading.Thread(target=reset_flag, daemon=True).start()
+
+    # Flush CSV file
+    if Config.CSV_ENABLED and csv_file_handle is not None:
+        try:
+            csv_file_handle.flush()
+            logger.info("📊 CSV file flushed")
+        except Exception as e:
+            logger.error(f"❌ Error flushing CSV file: {e}")
 
 
 def wait_for_motor_home(timeout: float = 10.0) -> bool:
@@ -1751,23 +1569,21 @@ def wait_for_motor_home(timeout: float = 10.0) -> bool:
     logger.warning("⏰ Timeout waiting for motor to reach home position")
     return False
 
+
 def q628_state_machine() -> None:
     """
-    Main Q628 state machine - Implements the final version with special timing rules:
-    - HV off exactly after configured delay after motor down
-    - Valves opened whenever motor moves
-    - 3.5s delay after motor positioning before closing valves
-    - Reports sample statistics at end of measurement
-    - Fixed to ensure all data is sent after measurement completion
+    Main Q628 state machine - Implements measurement with exact sample count control.
+    - Uses 50Hz sampling mapped to 100Hz grid
+    - Measurement ends exactly at the specified sample count
+    - Manages valve and motor operation with precise timing
     """
     logger.info("🔄 Q628 state machine started")
-
+    
     # Initial state
     system_state.set_q628_state(Q628State.POWER_UP)
     
     # Track motor movement events
     motor_down_time = None
-    measurement_samples = 0
     
     # Main state machine loop
     while not shutdown_requested.is_set():
@@ -1805,7 +1621,7 @@ def q628_state_machine() -> None:
                 # Preparing for idle state
                 if elapsed > 3.0:
                     # 3 seconds have passed, now wait 3.5 more seconds with valves open
-                    if elapsed > 5.5:  # 3.0 + 2.5 seconds
+                    if elapsed > 6.5:  # 3.0 + 3.5 seconds
                         # Only close valves 3.5 seconds after motor movement complete
                         set_valve(ValveStatus.CLOSED)
                         logger.info("🔧 Closed valves 3.5 seconds after motor reached position")
@@ -1813,17 +1629,8 @@ def q628_state_machine() -> None:
                         # Transition to IDLE
                         system_state.set_q628_state(Q628State.IDLE)
 
-                        # LED blinks slowly in IDLE state
-                        threading.Thread(
-                            target=blink_led,
-                            args=("slow", 3.0),
-                            daemon=True
-                        ).start()
-
             elif current_state == Q628State.IDLE:
                 # System idle, waiting for commands
-                # Reset measurement sample counter
-                measurement_samples = 0
                 
                 # Check if start command received
                 if enable_from_pc.is_set() or simulate_start.is_set():
@@ -1840,10 +1647,8 @@ def q628_state_machine() -> None:
                         set_high_voltage(True)
                         
                         # Start measurement and sampling
-                        adc_buffer.clear()
-                        system_state.clear_adc_data()
-                        start_sampling()
                         system_state.start_measurement()
+                        start_sampling()
 
                         # Reset the last_sent_index for new measurement
                         global last_sent_index
@@ -1870,7 +1675,7 @@ def q628_state_machine() -> None:
                     if GPIO.input(Config.START_TASTE_GPIO) == GPIO.LOW:
                         logger.info("👇 Button pressed, starting measurement")
 
-                        # Important: Store button press time
+                        # Store button press time
                         system_state.set_button_press_time()
                         
                         # Turn on High Voltage immediately upon button press
@@ -1878,23 +1683,14 @@ def q628_state_machine() -> None:
                         set_high_voltage(True)
                         
                         # START MEASUREMENT AND SAMPLING
-                        adc_buffer.clear()
-                        system_state.clear_adc_data()
-                        start_sampling()
                         system_state.start_measurement()
+                        start_sampling()
 
                         # Reset the last_sent_index for new measurement
                         last_sent_index = 0
 
                         # Transition to fixed initialization waiting phase
                         system_state.set_q628_state(Q628State.WAIT_HV)
-                        
-                        # Fast LED blinking during measurement
-                        threading.Thread(
-                            target=blink_led,
-                            args=("fast", Config.FIXED_INITIALIZATION_TIME),
-                            daemon=True
-                        ).start()
 
                 # Check for timeout (2 minutes)
                 if elapsed > 120.0:
@@ -1905,18 +1701,15 @@ def q628_state_machine() -> None:
                     system_state.set_q628_state(Q628State.IDLE)
 
             elif current_state == Q628State.WAIT_HV:
-                # Fixed initialization time instead of profile-based time
-                # HV is already on, just waiting for the fixed time
-                
+                # Fixed initialization time for HV stabilization
                 if elapsed > Config.FIXED_INITIALIZATION_TIME:
                     logger.info(f"⏱️ Fixed initialization time of {Config.FIXED_INITIALIZATION_TIME}s completed")
                     
                     # After fixed time, transition to START state
-                    # (Open valves & move motor down)
                     system_state.set_q628_state(Q628State.START)
 
             elif current_state == Q628State.START:
-                # MODIFIED: Always ensure valves are open before moving motor
+                # Ensure valves are open before moving motor
                 logger.info("🔧 Opening valves and moving motor down")
                 
                 # Open valves (activate both magnets)
@@ -1938,7 +1731,7 @@ def q628_state_machine() -> None:
                 
                 # Check if motor has finished moving (not busy)
                 if not (motor_status & MotorStatus.BUSY) or elapsed > 5.0:
-                    # MODIFIED: Turn HV off exactly after configured delay since motor reached bottom
+                    # Turn HV off after configured delay since motor reached bottom
                     if motor_down_time is not None:
                         time_since_motor_down = time.time() - motor_down_time
                         
@@ -1953,10 +1746,9 @@ def q628_state_machine() -> None:
                             system_state.set_q628_state(Q628State.ACTIV)
                             logger.info("📊 Active measurement phase started")
                         else:
-                            # Not yet reached the configured delay - calculate remaining wait time
+                            # Not yet reached the configured delay
                             remaining = hv_off_delay - time_since_motor_down
                             logger.debug(f"⏱️ Waiting {remaining:.3f}s more before turning off HV")
-                            # Stay in this state until exactly the configured time has passed
                     else:
                         logger.warning("⚠️ Motor down time not recorded, using elapsed time")
                         if elapsed > Config.HV_OFF_DELAY_AFTER_DOWN:
@@ -1967,52 +1759,33 @@ def q628_state_machine() -> None:
                             system_state.set_q628_state(Q628State.ACTIV)
                             logger.info("📊 Active measurement phase started")
 
-               # In the ACTIV state section:
             elif current_state == Q628State.ACTIV:
-                # Get precise timing information
+                # Get precise timing and sample information
                 button_press_time = system_state.get("button_press_time")
                 defined_time = system_state.get("defined_measurement_time")
+                current_virtual_samples = system_state.get("virtual_sample_count")
+                expected_virtual_samples = int(defined_time * 100)
                 
-                if button_press_time is not None:
-                    elapsed_since_start = time.time() - button_press_time
+                # CRITICAL: Only check for exact sample count, not time
+                if current_virtual_samples  >= expected_virtual_samples:
+                    logger.info(f"⏱️ Exact sample count reached: {current_virtual_samples}/{expected_virtual_samples}")
                     
-                    # Update sample count during measurement
-                    virtual_samples = len(virtual_buffer.get_all())
-                    real_samples = len(adc_buffer.get_all())
-                    expected_virtual = int(defined_time * 100)
-                    expected_real = int(defined_time * 16.67)  # Our real rate is 16.67Hz
-                    
-                    # Only log when count increases by 100+ samples
-                    if virtual_samples - measurement_samples >= 100:
-                        logger.debug(f"📊 Collected {real_samples} real samples and {virtual_samples} virtual samples " +
-                                f"({real_samples/(expected_real)*100:.1f}% real, {virtual_samples/(expected_virtual)*100:.1f}% virtual)")
-                        measurement_samples = virtual_samples
-                    
-                    # CRITICAL: Enforce exact measurement time
-                    if elapsed_since_start >= defined_time:
-                        logger.info(f"⏱️ Exact measurement time reached: {elapsed_since_start:.3f}s / {defined_time}s")
-                        logger.info(f"📊 Final sample count: {real_samples} real samples, {virtual_samples} virtual samples")
-                        logger.info(f"📊 Expected sample count: {expected_real} real samples, {expected_virtual} virtual samples")
-                        logger.info(f"📊 Sample rates: {real_samples/elapsed_since_start:.2f} Hz real, {virtual_samples/elapsed_since_start:.2f} Hz virtual")
-                        
-                        # Stop sampling
-                        stop_sampling()
-                        
-                        # Move to FINISH state
-                        system_state.set_q628_state(Q628State.FINISH)
-                    
-                    # CRITICAL: Also enforce exact virtual sample count if reached
-                    if virtual_samples >= expected_virtual:
-                        logger.info(f"⏱️ Exact virtual sample count reached: {virtual_samples}/{expected_virtual}")
-                        
-                        # Stop sampling
-                        stop_sampling()
-                        
-                        # Move to FINISH state
-                        system_state.set_q628_state(Q628State.FINISH)
+                    # Stop sampling
+                    stop_sampling()
+                    # Move to FINISH state
+                    system_state.set_q628_state(Q628State.FINISH)
                 
-                # Short sleep for precise timing
-                time.sleep(0.001)  # Responsive during active measurement
+                # Log warning if we're running over time but let it continue until sample count is reached
+                elif button_press_time is not None and (time.time() - button_press_time > defined_time + 10):
+                    # Only terminate if we're WAY over time (10+ seconds) as a failsafe
+                    logger.warning(f"⚠️ Measurement running significantly over time but hasn't reached target sample count")
+                    logger.warning(f"⚠️ Current: {current_virtual_samples}/{expected_virtual_samples} samples, " +
+                                f"Time: {time.time() - button_press_time:.1f}/{defined_time}s")
+                    
+                    # Continue measurement - don't terminate early
+                
+                # Short sleep for responsive state changes
+                time.sleep(0.001)
 
             elif current_state == Q628State.FINISH:
                 # Ensure sampling is stopped
@@ -2020,7 +1793,7 @@ def q628_state_machine() -> None:
                     stop_sampling()
                     logger.info("📊 Ensuring sampling is stopped")
                 
-                # MODIFIED: Open valves before motor movement
+                # Open valves before motor movement
                 logger.info("🔧 Opening valves for motor movement")
                 set_valve(ValveStatus.OPEN)
                 
@@ -2031,45 +1804,35 @@ def q628_state_machine() -> None:
                 # Wait for motor to reach home position
                 wait_for_motor_home(timeout=10)
                 
-                # MODIFIED: Wait exactly 3.5 seconds after motor reached position
+                # Wait exactly 3.5 seconds after motor reached position
                 logger.info("⏱️ Waiting exactly 3.5 seconds after motor reached home position")
-                time.sleep(3.5)  # CHANGED from 1.5 to 3.5 seconds
+                time.sleep(3.5)
                 
                 # Close valves (deactivate magnets)
                 logger.info("🔧 Closing valves 3.5s after motor reached home")
                 set_valve(ValveStatus.CLOSED)
 
                 # Report sample statistics at end of measurement
-                total_real_samples = len(adc_buffer.get_all())
+                virtual_samples = system_state.get("virtual_sample_count")
+                real_samples = len(adc_buffer.get_all())
                 defined_time = system_state.get("defined_measurement_time")
-                expected_real_samples = int(defined_time * Config.ADC_SAMPLE_RATE)  # ~60Hz
-                expected_virtual_samples = int(defined_time * 100)  # 100Hz expected by Delphi
+                expected_virtual_samples = int(defined_time * 100)
                 
-                # CRITICAL: Do NOT reset last_sent_index here
-                # Keep tracking position to ensure all data is sent
-                
-                # Provide comprehensive measurement summary at the end
+                # Provide comprehensive measurement summary
                 logger.info("=" * 80)
                 logger.info(f"📊 MEASUREMENT COMPLETE - Sample Statistics:")
-                logger.info(f"📊 Total real ADC samples: {total_real_samples}")
-                logger.info(f"📊 Real sample rate: {total_real_samples/defined_time:.2f} Hz")
+                logger.info(f"📊 Real samples collected: {real_samples}")
+                logger.info(f"📊 Virtual samples in 100Hz grid: {virtual_samples}")
                 logger.info(f"📊 Expected virtual samples (100Hz): {expected_virtual_samples}")
+                logger.info(f"📊 Real sample rate: {real_samples/defined_time:.2f} Hz")
+                logger.info(f"📊 Virtual sample rate: {virtual_samples/defined_time:.2f} Hz")
                 logger.info(f"📊 Samples sent to client: {last_sent_index}")
                 logger.info(f"📊 Measurement duration: {defined_time}s")
-                logger.info(f"📊 Remaining samples to send: {max(0, total_real_samples - last_sent_index)}")
-                
-                # Log warning if we have significantly fewer samples than expected
-                if total_real_samples < expected_real_samples * 0.9:
-                    logger.warning(f"⚠️ Collected fewer real samples than expected ({total_real_samples} vs ~{expected_real_samples})")
                 logger.info("=" * 80)
 
-                # End measurement but continue sending data
-                # CRITICAL: Set end_measurement but don't clear the sample buffer
+                # End measurement but don't clear buffers
                 system_state.end_measurement()
                 
-                # CRITICAL: Don't clear adc_buffer yet - the data transfer is still in progress
-                # Data transfer completion is handled in the handle_client function
-
                 # Return to IDLE
                 system_state.set_q628_state(Q628State.IDLE)
 
@@ -2098,81 +1861,10 @@ def q628_state_machine() -> None:
             time.sleep(1.0)  # Longer sleep after error
 
 
-def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
-    """
-    Parse Delphi-compatible TTCP_CMD packet with improved debugging
-    """
-    try:
-        # Show raw command bytes for debugging
-        logger.info(f"Raw command data: {data.hex()}")
-        
-        if len(data) < 32:  # Delphi sends 8 x 4-byte ints = 32 bytes
-            logger.error(f"Invalid TTCP_CMD size: {len(data)} bytes, expected 32+")
-            return None
-
-        # Unpack 8 integers from the data
-        size, cmd_int, runtime, hvac, hvdc, profile1, profile2, wait_acdc = struct.unpack("<8i", data[:32])
-        
-        # Debug log the integer values
-        logger.info(f"Unpacked command: size={size}, cmd_int={cmd_int}, runtime={runtime}, " +
-                   f"hvac={hvac}, hvdc={hvdc}, profile1={profile1}, profile2={profile2}, wait_acdc={wait_acdc}")
-
-        # Convert command integer to character
-        # This is critical - cmd_int is the ASCII value of the command character
-        cmd_char = chr(cmd_int) if 32 <= cmd_int <= 126 else '?'
-        logger.info(f"Command character from ASCII {cmd_int}: '{cmd_char}'")
-        
-        # Map to command type
-        cmd_type = next((c for c in CommandType if c.value == cmd_char), CommandType.UNKNOWN)
-        logger.info(f"Mapped to command type: {cmd_type.name}")
-
-        # GEÄNDERT: Logge, dass Profile ignoriert werden
-        if profile1 != 0 or profile2 != 0 or wait_acdc != 0:
-            logger.info("⚠️ Profile settings received but will be IGNORED (profile1=%d, profile2=%d, wait_acdc=%d)",
-                    profile1, profile2, wait_acdc)
-
-        # Calculate DAC voltage for HV DC value using 1:2000 ratio
-        dac_voltage = hvdc / 2000.0
-        logger.info("Parsed TTCP_CMD: %s (runtime=%ds, HVAC=%d, HVDC=%d → DAC=%fV)",
-                    cmd_char, runtime, hvac, hvdc, dac_voltage)
-
-        # Update system state with received parameters
-        system_state.update(
-            profile_hin=profile1,
-            profile_zurueck=profile2,
-            wait_acdc=wait_acdc,
-            hv_ac_value=hvac,
-            hv_dc_value=hvdc
-        )
-
-        # When receiving START command, set the defined measurement time
-        if cmd_type == CommandType.START:
-            logger.info(f"🔄 START COMMAND RECOGNIZED!")
-            system_state.update(defined_measurement_time=runtime)
-            logger.info(f"📏 Set defined measurement time to {runtime} seconds")
-            logger.info(f"⚡ Set HV DC value to {hvdc}V (DAC voltage will be {dac_voltage:.4f}V)")
-
-        return {
-            'size': size,
-            'cmd': cmd_char,
-            'cmd_type': cmd_type,
-            'runtime': runtime,
-            'hvac': hvac,
-            'hvdc': hvdc,
-            'profile1': profile1,
-            'profile2': profile2,
-            'wait_acdc': wait_acdc
-        }
-    except Exception as e:
-        logger.error(f"Error parsing TTCP_CMD: {e}", exc_info=True)
-        return None
-    
-
-
 def build_ttcp_data() -> bytes:
     """
-    Generates a formatted TTCP_DATA response for Delphi using interpolated virtual samples.
-    Also handles IDLE state properly by sending last known values.
+    Generates a formatted TTCP_DATA response for Delphi using 50Hz samples
+    mapped to 100Hz grid. Each real sample is sent twice to fill the 100Hz grid.
     Values are scaled by SCALE_FACTOR to improve visual deflection in Delphi.
     """
     global last_sent_index, sent_packet_counter
@@ -2268,12 +1960,9 @@ def build_ttcp_data() -> bytes:
                     # Apply scaling factor to improve visualization
                     scaled_value = raw_value * SCALE_FACTOR
                     
-                    # Sign-extend if needed
-                    if scaled_value & 0x80000000:  # Check sign bit
-                        delphi_value = scaled_value
-                    else:
-                        delphi_value = scaled_value
-                        
+                    # Ensure we don't exceed 32-bit integer limits
+                    delphi_value = min(2147483647, max(-2147483648, scaled_value))
+                    
                     # Add to tracking for CSV logging
                     sent_values.append((raw_value, delphi_value, False, i))
                 else:
@@ -2340,20 +2029,17 @@ def build_ttcp_data() -> bytes:
             
             for i in range(50):
                 if i < data_count:
-                    # Each virtual sample is (value, is_interpolated, virtual_idx)
-                    value, is_interpolated, virtual_idx = samples_to_send[i]
+                    # Each virtual sample is (value, is_virtual, virtual_idx)
+                    value, is_virtual, virtual_idx = samples_to_send[i]
                     
                     # Apply scaling factor to improve visualization
                     scaled_value = value * SCALE_FACTOR
                     
-                    # Sign-extend 22-bit to 32-bit for Delphi compatibility
-                    if scaled_value & 0x80000000:  # Check sign bit in scaled value
-                        delphi_value = scaled_value
-                    else:
-                        delphi_value = scaled_value
+                    # Ensure we don't exceed 32-bit integer limits
+                    delphi_value = min(2147483647, max(-2147483648, scaled_value))
                     
                     # Add to our tracking for CSV logging
-                    sent_values.append((value, delphi_value, is_interpolated, virtual_idx))
+                    sent_values.append((value, delphi_value, is_virtual, virtual_idx))
                 else:
                     delphi_value = 0
                 
@@ -2371,7 +2057,7 @@ def build_ttcp_data() -> bytes:
                 last_sent_index += data_count
                 
                 # Log progress periodically
-                if last_sent_index % 300 == 0 or last_sent_index >= total_virtual_samples:
+                if last_sent_index % 500 == 0 or last_sent_index >= total_virtual_samples:
                     progress_pct = (last_sent_index / max(1, expected_virtual_total)) * 100
                     logger.info(f"📊 Progress: {last_sent_index}/{expected_virtual_total} virtual samples sent ({progress_pct:.1f}%)")
                 
@@ -2389,7 +2075,72 @@ def build_ttcp_data() -> bytes:
         struct.pack_into('<i', minimal_data, 0, 256)  # Size
         struct.pack_into('<i', minimal_data, 4, 0)    # Runtime
         return bytes(minimal_data)
-    
+
+
+def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse Delphi-compatible TTCP_CMD packet with improved debugging
+    """
+    try:
+        # Show raw command bytes for debugging
+        logger.info(f"Raw command data: {data.hex()}")
+        
+        if len(data) < 32:  # Delphi sends 8 x 4-byte ints = 32 bytes
+            logger.error(f"Invalid TTCP_CMD size: {len(data)} bytes, expected 32+")
+            return None
+
+        # Unpack 8 integers from the data
+        size, cmd_int, runtime, hvac, hvdc, profile1, profile2, wait_acdc = struct.unpack("<8i", data[:32])
+        
+        # Debug log the integer values
+        logger.info(f"Unpacked command: size={size}, cmd_int={cmd_int}, runtime={runtime}, " +
+                   f"hvac={hvac}, hvdc={hvdc}, profile1={profile1}, profile2={profile2}, wait_acdc={wait_acdc}")
+
+        # Convert command integer to character
+        # This is critical - cmd_int is the ASCII value of the command character
+        cmd_char = chr(cmd_int) if 32 <= cmd_int <= 126 else '?'
+        logger.info(f"Command character from ASCII {cmd_int}: '{cmd_char}'")
+        
+        # Map to command type
+        cmd_type = next((c for c in CommandType if c.value == cmd_char), CommandType.UNKNOWN)
+        logger.info(f"Mapped to command type: {cmd_type.name}")
+
+        # Calculate DAC voltage for HV DC value using 1:2000 ratio
+        dac_voltage = hvdc / 2000.0
+        logger.info("Parsed TTCP_CMD: %s (runtime=%ds, HVAC=%d, HVDC=%d → DAC=%fV)",
+                    cmd_char, runtime, hvac, hvdc, dac_voltage)
+
+        # Update system state with received parameters
+        system_state.update(
+            profile_hin=profile1,
+            profile_zurueck=profile2,
+            wait_acdc=wait_acdc,
+            hv_ac_value=hvac,
+            hv_dc_value=hvdc
+        )
+
+        # When receiving START command, set the defined measurement time
+        if cmd_type == CommandType.START:
+            logger.info(f"🔄 START COMMAND RECOGNIZED!")
+            system_state.update(defined_measurement_time=runtime)
+            logger.info(f"📏 Set defined measurement time to {runtime} seconds")
+            logger.info(f"⚡ Set HV DC value to {hvdc}V (DAC voltage will be {dac_voltage:.4f}V)")
+
+        return {
+            'size': size,
+            'cmd': cmd_char,
+            'cmd_type': cmd_type,
+            'runtime': runtime,
+            'hvac': hvac,
+            'hvdc': hvdc,
+            'profile1': profile1,
+            'profile2': profile2,
+            'wait_acdc': wait_acdc
+        }
+    except Exception as e:
+        logger.error(f"Error parsing TTCP_CMD: {e}", exc_info=True)
+        return None
+
 
 def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
     """
@@ -2405,15 +2156,15 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
     # Set TCP_NODELAY for this connection (critical for Delphi)
     try:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        conn.settimeout(1.0)  # Increased from 0.05 to ensure complete data transfer
+        conn.settimeout(1.0)
     except Exception as e:
         logger.warning("⚠️ Could not set TCP_NODELAY for %s: %s", client_id, e)
 
     # Track consecutive errors
     error_count = 0
-    MAX_ERRORS = 10  # Increased for more resilience
+    MAX_ERRORS = 10
 
-    # Send immediate response on connection (required by Delphi)
+    # Send immediate response on connection
     response = build_ttcp_data()
     try:
         conn.sendall(response)
@@ -2424,21 +2175,14 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
         system_state.decrement_clients()
         return
 
-    # Track if we need to complete a data transfer after measurement end
-    completed_measurement = False
-    data_transfer_complete = False
+    # Track last data send time for periodic updates
     last_data_send_time = time.time()
     
     try:
         while not shutdown_requested.is_set():
             current_time = time.time()
             
-            # === CRITICAL FIX: Check if we need to complete data transfer ===
-            if (completed_measurement and not data_transfer_complete):
-                # [... existing data transfer completion code ...]
-                pass
-
-            # === NEW: Always send status updates in IDLE state ===
+            # Send periodic status updates in IDLE state
             if (system_state.get_q628_state() == Q628State.IDLE and 
                 current_time - last_data_send_time >= 0.5):
                 try:
@@ -2468,7 +2212,7 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
 
                 # Parse the command if it looks like a valid TTCP_CMD
                 cmd_info = None
-                if len(cmd_data) >= 32:  # Ensure we have enough data for a command
+                if len(cmd_data) >= 32:
                     cmd_info = parse_ttcp_cmd(cmd_data)
 
                 if cmd_info:
@@ -2482,20 +2226,12 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
                         enable_from_pc.set()
                         logger.info("✅ Enable flag set - waiting for button press")
                         
-                        # Reset data transfer flags for new measurement
-                        completed_measurement = False
-                        data_transfer_complete = False
-                        
                         # Reset last_sent_index for new measurement
                         last_sent_index = 0
 
                     elif cmd_info['cmd_type'] == CommandType.TRIGGER:  # Simulate button press
                         logger.info("🔄 TRIGGER command received (simulate button press)")
                         simulate_start.set()
-                        
-                        # Reset data transfer flags for new measurement
-                        completed_measurement = False
-                        data_transfer_complete = False
 
                     elif cmd_info['cmd_type'] == CommandType.GET_STATUS:  # Get status (polling)
                         logger.info("📊 GET STATUS command received")
@@ -2517,16 +2253,12 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
                         set_high_voltage(False)
                         set_valve(ValveStatus.CLOSED)
                         move_motor(MotorPosition.UP)
-                        
-                        # Reset data transfer flags
-                        completed_measurement = False
-                        data_transfer_complete = False
 
                     else:
                         logger.warning(f"⚠️ Unknown command: {cmd_info['cmd']}")
                 else:
                     # Could not parse as a valid command
-                    logger.warning(f"⚠️ Received invalid command data: {cmd_data.hex()}")
+                                        logger.warning(f"⚠️ Received invalid command data: {cmd_data.hex()}")
 
             except socket.timeout:
                 # Just continue the loop on timeout
@@ -2547,8 +2279,7 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
                 time.sleep(0.5)
                 continue
 
-            # Always send a response packet with current status
-            # This is critical for Delphi compatibility
+            # Always send a response packet with current status after command processing
             try:
                 response = build_ttcp_data()
                 last_data_send_time = current_time
@@ -2570,27 +2301,9 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
                 if error_count >= MAX_ERRORS:
                     logger.error("⛔ Too many consecutive errors, closing connection to %s", client_id)
                     break
-                    
-            # === Check if measurement just completed ===
-            current_state = system_state.get_q628_state()
-            previous_state = system_state.get("prev_q628_state")
             
-            if (current_state == Q628State.IDLE and 
-                previous_state == Q628State.FINISH and 
-                not completed_measurement):
-                logger.info("🏁 Measurement completed - ensuring all data is sent")
-                completed_measurement = True
-                data_transfer_complete = False
-                
-                # Send immediate response to start the completion process
-                try:
-                    response = build_ttcp_data()
-                    conn.sendall(response)
-                except Exception as e:
-                    logger.error(f"❌ Error starting data transfer completion: {e}")
-            
-            # Keep track of previous state for state transition detection
-            system_state.set("prev_q628_state", current_state)
+            # Update previous state for state transition detection
+            system_state.set("prev_q628_state", system_state.get_q628_state())
 
     except Exception as e:
         logger.error("❌ Unhandled error with client %s: %s", client_id, e, exc_info=True)
@@ -2601,8 +2314,7 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
             pass
         system_state.decrement_clients()
         logger.info("👋 Connection to %s closed", client_id)
-            
- 
+
 
 def free_port(port: int) -> None:
     """
@@ -2623,6 +2335,7 @@ def free_port(port: int) -> None:
     except Exception as e:
         logger.warning("⚠️ Error freeing port %d: %s", port, e)
         
+
 def ttcp_server(port: int) -> None:
     """
     TCP server with proper socket options and error handling
@@ -2636,7 +2349,7 @@ def ttcp_server(port: int) -> None:
 
     while not shutdown_requested.is_set():
         try:
-            # Instead of calling free_port, just create a new socket with SO_REUSEADDR
+            # Create socket with SO_REUSEADDR
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -2726,19 +2439,20 @@ def status_monitor() -> None:
             )
             logger.info("📊 %s", status)
 
-            # Add virtual sampling status
+            # Add sampling status
             if state_dict['measurement_active']:
-                virtual_samples = len(virtual_buffer.get_all())
+                virtual_samples = state_dict['virtual_sample_count']
                 real_samples = len(adc_buffer.get_all())
-                expected = int(state_dict['defined_measurement_time'] * Config.VIRTUAL_SAMPLE_RATE)
-                logger.info(f"📊 Virtual samples: {virtual_samples}/{expected} ({virtual_samples/expected*100:.1f}%), Real samples: {real_samples}")
+                expected = int(state_dict['defined_measurement_time'] * 100)
+                logger.info(f"📊 Sample status: {virtual_samples}/{expected} virtual samples ({virtual_samples/expected*100:.1f}%)")
+                logger.info(f"📊 Real samples: {real_samples}, Virtual samples: {virtual_samples}")
 
             # Check IP address periodically
             if state_dict["cycle_count"] % 5 == 0:
                 get_current_ip()
 
         except Exception as e:
-            logger.error("❌ Error in status monitor: %s", e)
+            pass
 
         # Sleep for the configured interval, but check shutdown_requested more frequently
         for _ in range(Config.STATUS_UPDATE_INTERVAL):
@@ -2877,15 +2591,26 @@ def cleanup() -> None:
         GPIO.output(Config.MAGNET1_GPIO, GPIO.LOW)
         GPIO.output(Config.MAGNET2_GPIO, GPIO.LOW)
 
+        # Close any open CSV file
+        global csv_file_handle
+        if csv_file_handle is not None:
+            try:
+                csv_file_handle.flush()
+                csv_file_handle.close()
+                logger.info("✅ CSV file closed during cleanup")
+            except Exception as e:
+                logger.error(f"❌ Error closing CSV file during cleanup: {e}")
+
         # Cleanup GPIO
         GPIO.cleanup()
         logger.info("✅ Hardware cleanup completed")
     except Exception as e:
         logger.error("❌ Error during cleanup: %s", e)
 
+
 def main() -> None:
-    """Main application entry point with improved setup"""
-    # Only setup logging once, at the start of the program
+    """Main application entry point"""
+    # Setup logging
     global logger
     logger = logging.getLogger("qumat628")
     
@@ -2893,8 +2618,8 @@ def main() -> None:
     if not logger.handlers:
         logger = setup_logging()
 
-    logger.info("Starting QUMAT628 control system with improved 100Hz virtual interpolation...")
-    logger.info("📊 Targeting 16.67Hz real sampling with interpolation to 100Hz virtual grid")
+    logger.info("Starting QUMAT628 control system with 50Hz sampling mapped to 100Hz grid...")
+    logger.info("📊 Target: sample at 50Hz and map to 100Hz by duplicating each sample")
 
     # Initialize hardware
     if not initialize_hardware():
@@ -2943,9 +2668,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         # Simple output at startup
-        print("QUMAT628 Control System with 100Hz Delphi Compatibility starting...")
+        print("QUMAT628 Control System with 50Hz to 100Hz mapping starting...")
         
-        # Run the main function - logging will be set up inside
+        # Run the main function
         main()
     except Exception as e:
         # Get the logger if it exists
