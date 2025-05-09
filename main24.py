@@ -1876,7 +1876,10 @@ def build_ttcp_data() -> bytes:
         # Get system status
         state_dict = system_state.get_status_dict()
         defined_time = state_dict["defined_measurement_time"]
-        runtime = state_dict["runtime"]
+        
+        # Ensure runtime is an integer
+        runtime = int(state_dict["runtime"])  # Convert to integer
+        
         current_state = state_dict["q628_state"]
         
         # Initialize buffer for 256 bytes
@@ -1884,7 +1887,7 @@ def build_ttcp_data() -> bytes:
 
         # Standard fields (1-42)
         struct.pack_into('<i', data, 0, 256)  # Size: 256 bytes
-        struct.pack_into('<i', data, 4, runtime)  # Runtime
+        struct.pack_into('<i', data, 4, runtime)  # Runtime as integer
         
         # Temperature, etc.
         temp_int = int(state_dict["temperature"] * 100)
@@ -2076,7 +2079,6 @@ def build_ttcp_data() -> bytes:
         struct.pack_into('<i', minimal_data, 4, 0)    # Runtime
         return bytes(minimal_data)
 
-
 def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
     """
     Parse Delphi-compatible TTCP_CMD packet with improved debugging
@@ -2110,27 +2112,31 @@ def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
         logger.info("Parsed TTCP_CMD: %s (runtime=%ds, HVAC=%d, HVDC=%d → DAC=%fV)",
                     cmd_char, runtime, hvac, hvdc, dac_voltage)
 
-        # Update system state with received parameters
+        # Add 0.4 seconds compensation to runtime for all commands
+        # Store as a float internally, but we'll convert to int when needed
+        adjusted_runtime = runtime + 0.4  # Add 400ms compensation
+
+        # Update system state with received parameters and adjusted runtime
         system_state.update(
             profile_hin=profile1,
             profile_zurueck=profile2,
             wait_acdc=wait_acdc,
             hv_ac_value=hvac,
-            hv_dc_value=hvdc
+            hv_dc_value=hvdc,
+            defined_measurement_time=adjusted_runtime
         )
 
-        # When receiving START command, set the defined measurement time
+        # Log the adjustment when it's a START command
         if cmd_type == CommandType.START:
             logger.info(f"🔄 START COMMAND RECOGNIZED!")
-            system_state.update(defined_measurement_time=runtime)
-            logger.info(f"📏 Set defined measurement time to {runtime} seconds")
+            logger.info(f"📏 Set defined measurement time to {runtime} seconds (adjusted to {adjusted_runtime} seconds)")
             logger.info(f"⚡ Set HV DC value to {hvdc}V (DAC voltage will be {dac_voltage:.4f}V)")
 
         return {
             'size': size,
             'cmd': cmd_char,
             'cmd_type': cmd_type,
-            'runtime': runtime,
+            'runtime': runtime,  # Keep the original integer runtime here
             'hvac': hvac,
             'hvdc': hvdc,
             'profile1': profile1,
