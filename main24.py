@@ -13,6 +13,7 @@ import RPi.GPIO as GPIO
 import subprocess
 import select
 import os
+from smbus2 import SMBus, i2c_msg
 from enum import Enum, Flag, auto
 from typing import Dict, Any, Optional, Tuple, Union, List
 from collections import deque
@@ -835,7 +836,9 @@ def initialize_hardware() -> bool:
         # Test I2C connection to motor controller
         try:
             with i2c_lock:
-                i2c_bus.read_byte(Config.I2C_ADDR_MOTOR)
+                with SMBus(1) as bus:
+                    read_test = i2c_msg.read(Config.I2C_ADDR_MOTOR, 1)
+                    bus.i2c_rdwr(read_test)
             logger.info("✅ Motor I2C connection successfully tested")
 
             # Read initial motor status
@@ -848,7 +851,9 @@ def initialize_hardware() -> bool:
         # Test I2C connection to humidity/temperature sensor
         try:
             with i2c_lock:
-                i2c_bus.read_byte(Config.HYT_ADDR)
+                with SMBus(1) as bus:
+                    read_test = i2c_msg.read(Config.HYT_ADDR, 1)
+                    bus.i2c_rdwr(read_test)
             logger.info("✅ HYT sensor I2C connection successfully tested")
         except Exception as e:
             logger.warning("⚠️ HYT sensor I2C connection test failed: %s", e)
@@ -1041,23 +1046,31 @@ def adc_sampling_thread() -> None:
 
 def read_motor_status() -> Optional[MotorStatus]:
     """
-    Read motor status via I2C with improved error handling
+    Read motor status via I2C with improved error handling using i2c_rdwr
     """
     try:
         with i2c_lock:
-            # First send passive mode command with proper timing
-            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, Config.CMD_PASSIV)
-            time.sleep(0.05)  # Increased delay for stability
+            with SMBus(1) as bus:
+                # First send passive mode command with proper timing
+                write_passiv = i2c_msg.write(Config.I2C_ADDR_MOTOR, [Config.CMD_PASSIV])
+                bus.i2c_rdwr(write_passiv)
+                time.sleep(0.05)  # Increased delay for stability
 
-            # Then send status request command
-            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, Config.CMD_STATUS)
-            time.sleep(0.05)  # Increased delay for stability
-
-            # Read status byte
-            status_byte = i2c_bus.read_byte(Config.I2C_ADDR_MOTOR)
-            
-            # Log raw status for debugging
-            logger.debug(f"Raw motor status byte: 0x{status_byte:02X} (binary: {bin(status_byte)[2:].zfill(8)})")
+                # Then send status request command and read response
+                write_status = i2c_msg.write(Config.I2C_ADDR_MOTOR, [Config.CMD_STATUS])
+                read_status = i2c_msg.read(Config.I2C_ADDR_MOTOR, 1)
+                bus.i2c_rdwr(write_status)
+                time.sleep(0.05)  # Increased delay for stability
+                
+                # Read byte separately since we need the delay between write and read
+                read_status = i2c_msg.read(Config.I2C_ADDR_MOTOR, 1)
+                bus.i2c_rdwr(read_status)
+                
+                # Get the status byte from the read message
+                status_byte = list(read_status)[0]
+                
+                # Log raw status for debugging
+                logger.debug(f"Raw motor status byte: 0x{status_byte:02X} (binary: {bin(status_byte)[2:].zfill(8)})")
 
         # Convert to MotorStatus object
         status = MotorStatus.from_byte(status_byte)
@@ -1070,23 +1083,31 @@ def read_motor_status() -> Optional[MotorStatus]:
         logger.error("❌ Error reading motor status: %s", e)
         return None
 
-
 def read_temperature_humidity() -> Tuple[float, float]:
     """
-    Read temperature and humidity from HYT sensor
-
+    Read temperature and humidity from HYT sensor using i2c_rdwr
+    
     Returns:
         Tuple of (temperature in °C, humidity in %)
     """
     try:
         # Start measurement
         with i2c_lock:
-            i2c_bus.write_byte(Config.HYT_ADDR, 0x00)
+            with SMBus(1) as bus:
+                # Send measurement command
+                write_cmd = i2c_msg.write(Config.HYT_ADDR, [0x00])
+                bus.i2c_rdwr(write_cmd)
+                
         time.sleep(0.1)  # Wait for measurement
 
         # Read 4 bytes of data
         with i2c_lock:
-            data = i2c_bus.read_i2c_block_data(Config.HYT_ADDR, 0, 4)
+            with SMBus(1) as bus:
+                read_data = i2c_msg.read(Config.HYT_ADDR, 4)
+                bus.i2c_rdwr(read_data)
+                
+                # Convert the read message to a list of bytes
+                data = list(read_data)
 
         # First two bytes: humidity (14 bits)
         # Last two bytes: temperature (14 bits)
@@ -1104,7 +1125,6 @@ def read_temperature_humidity() -> Tuple[float, float]:
     except Exception as e:
         logger.error("❌ Error reading temperature/humidity: %s", e)
         return (23.5, 45.0)  # Return default values on error
-
 
 def read_adc_22bit() -> int:
     """
@@ -1290,7 +1310,7 @@ def motor_status_monitor() -> None:
 
 def move_motor(position: MotorPosition) -> bool:
     """
-    Move motor to specified position
+    Move motor to specified position using i2c_rdwr
 
     Args:
         position: MotorPosition.UP or MotorPosition.DOWN
@@ -1322,7 +1342,9 @@ def move_motor(position: MotorPosition) -> bool:
         # Send appropriate command to motor controller
         cmd = Config.CMD_UP if position == MotorPosition.UP else Config.CMD_DOWN
         with i2c_lock:
-            i2c_bus.write_byte(Config.I2C_ADDR_MOTOR, cmd)
+            with SMBus(1) as bus:
+                write_cmd = i2c_msg.write(Config.I2C_ADDR_MOTOR, [cmd])
+                bus.i2c_rdwr(write_cmd)
 
         # Wait briefly and check if command was accepted
         time.sleep(0.1)
@@ -2114,7 +2136,7 @@ def parse_ttcp_cmd(data: bytes) -> Optional[Dict[str, Any]]:
 
         # Add 0.4 seconds compensation to runtime for all commands
         # Store as a float internally, but we'll convert to int when needed
-        adjusted_runtime = runtime + 0.4  # Add 400ms compensation
+        adjusted_runtime = runtime + 0.25  # Add 250ms compensation
 
         # Update system state with received parameters and adjusted runtime
         system_state.update(
