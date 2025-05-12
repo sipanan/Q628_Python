@@ -99,13 +99,13 @@ class Config:
     VIRTUAL_BUFFER_SIZE = 12000  # Size of buffer for 100Hz virtual samples - increased for longer measurements
     ADC_CLK_DELAY = 0.000002     # Clock delay for bit-banged SPI (2μs for ~250kHz)
     DAC_CLK_DELAY = 0.00001      # Clock delay for bit-banged SPI
-    FIXED_INITIALIZATION_TIME = 2 # Fixed initialization time for ADC/DAC
+    FIXED_INITIALIZATION_TIME = 0 # Fixed initialization time for ADC/DAC
     
     # HV Control timing
     HV_OFF_DELAY_AFTER_DOWN = 4.0  # Delay in seconds before turning HV off after motor down
     
     # Scale factor for better visualization in Delphi
-    SCALE_FACTOR = 16            # 9-bit shift equivalent
+    SCALE_FACTOR = 16            # 4-bit shift equivalent
 
 
 # ===== Enumerations for State Management =====
@@ -1287,7 +1287,7 @@ def motor_status_monitor() -> None:
                 # If motor is in error state, log it (but avoid spamming logs)
                 if status & MotorStatus.ERROR:
                     if not error_logged:
-                        logger.warning("⚠️ Motor error detected! Status: %s", status)
+                        logger.warning("Status: %s", status)
                         error_logged = True
                 else:
                     # Reset the error logged flag when error clears
@@ -1310,7 +1310,9 @@ def motor_status_monitor() -> None:
 
 def move_motor(position: MotorPosition) -> bool:
     """
-    Move motor to specified position using i2c_rdwr
+    Move motor to specified position using i2c_rdwr.
+    - Always ensures valves are open before any motor movement
+    - When moving UP, automatically closes valves after 3 seconds
 
     Args:
         position: MotorPosition.UP or MotorPosition.DOWN
@@ -1322,6 +1324,16 @@ def move_motor(position: MotorPosition) -> bool:
     logger.info("🛠️ Moving motor: %s", position_str.upper())
 
     try:
+        # CRITICAL SAFETY CHECK: Always ensure valves are open before motor movement
+        valve_status = system_state.get("valve_status")
+        if valve_status != ValveStatus.OPEN:
+            logger.info("🔧 Safety check: Opening valves before motor movement")
+            set_valve(ValveStatus.OPEN)
+            # Brief delay to ensure valves fully open
+            time.sleep(0.5)
+        else:
+            logger.debug("✅ Valves already open for motor movement")
+
         system_state.set("motor_position", position)
 
         # Check current motor status
@@ -1349,6 +1361,18 @@ def move_motor(position: MotorPosition) -> bool:
         # Wait briefly and check if command was accepted
         time.sleep(0.1)
         status = read_motor_status()
+        
+        # For UP movement, schedule automatic valve closing after 3 seconds
+        if position == MotorPosition.UP:
+            def close_valve_after_delay():
+                logger.info("⏱️ Scheduling valve closing in 3 seconds after UP movement")
+                time.sleep(4.0)  # 3 second delay
+                logger.info("🔧 Auto-closing valves after UP movement")
+                set_valve(ValveStatus.CLOSED)
+                
+            # Start the delayed valve closing in a separate thread
+            threading.Thread(target=close_valve_after_delay, daemon=True).start()
+            
         if status and (status & MotorStatus.BUSY):
             logger.info("✅ Motor command accepted, motor is now busy")
             return True
@@ -1358,6 +1382,7 @@ def move_motor(position: MotorPosition) -> bool:
         logger.error("❌ Error moving motor: %s", e)
         system_state.set("last_error", f"Motor error: {str(e)}")
         return False
+    
 
 
 def set_high_voltage(enabled: bool) -> None:
